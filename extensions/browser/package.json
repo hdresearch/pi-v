@@ -1,0 +1,12 @@
+{
+  "name": "pi-extension-browser",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "puppeteer": "^24.2.0"
+  }
+}

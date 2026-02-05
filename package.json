@@ -1,0 +1,23 @@
+{
+  "name": "@hdresearch/pi-v",
+  "version": "0.1.0",
+  "description": "Pi extensions and skills for Vers VM management, browser automation, background processes, and plan mode",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/hdresearch/pi-v.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/background-process.ts",
+      "./extensions/browser",
+      "./extensions/plan-mode",
+      "./extensions/vers-swarm.ts",
+      "./extensions/vers-vm.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  }
+}
