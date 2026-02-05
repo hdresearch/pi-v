@@ -1,6 +1,6 @@
 # pi-v
 
-Pi extensions and skills for [Vers](https://vers.ai) VM management and development workflows.
+Pi extensions and skills for [Vers](https://vers.sh) VM management and development workflows.
 
 ## Install
 
