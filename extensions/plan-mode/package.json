@@ -1,0 +1,9 @@
+{
+  "name": "pi-extension-plan-mode",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

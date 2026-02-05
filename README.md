@@ -4,6 +4,14 @@ Pi extensions and skills for [Vers](https://vers.sh) VM management and developme
 
 ## Install
 
+One-liner that checks for pi, installs it if needed, and sets everything up:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hdresearch/pi-v/main/install.sh | bash
+```
+
+Or if you already have pi:
+
 ```bash
 pi install git@github.com:hdresearch/pi-v.git
 ```
