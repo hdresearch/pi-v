@@ -4,8 +4,8 @@
  * detects running instances, and manages CDP debug port.
  */
 
-import { execSync, exec } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { execSync, exec, spawn as nodeSpawn } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
@@ -281,7 +281,7 @@ export function launchChrome(opts: {
 	// Launch binary directly — NOT via `open -a` which may reconnect to
 	// an existing Chrome instance that doesn't have the debug port.
 	// Use spawn to detach the process.
-	const child = require("node:child_process").spawn(binary, args, {
+	const child = nodeSpawn(binary, args, {
 		detached: true,
 		stdio: "ignore",
 	});
@@ -358,4 +358,92 @@ export async function ensureChromeWithCdp(opts: {
 	const ready = await waitForCdp(port);
 	if (!ready) throw new Error(`Chrome launched but CDP port ${port} not responding.`);
 	return { port, restarted: false, launched: true };
+}
+
+// ─── Isolated Pi Browser (fallback when user declines restart) ──────────────
+
+/** Data dir for the isolated pi browser — persists between sessions */
+function getPiBrowserDataDir(): string {
+	return join(homedir(), ".pi", "browser-data");
+}
+
+/**
+ * Import cookies and login data from an existing Chrome profile into the
+ * isolated pi browser data dir. Only copies if destination doesn't already
+ * exist (won't overwrite established pi browser sessions).
+ */
+export function importCookiesFromProfile(profileDirName: string, userDataDir?: string): { imported: string[] } {
+	const srcDir = userDataDir || getUserDataDir();
+	if (!srcDir) throw new Error("Chrome user data directory not found.");
+
+	const srcProfile = join(srcDir, profileDirName);
+	if (!existsSync(srcProfile)) {
+		throw new Error(`Chrome profile "${profileDirName}" not found at ${srcProfile}`);
+	}
+
+	const destDir = join(getPiBrowserDataDir(), "Default");
+	mkdirSync(destDir, { recursive: true });
+
+	const filesToCopy = ["Cookies", "Cookies-journal", "Login Data", "Login Data-journal"];
+	const imported: string[] = [];
+
+	for (const file of filesToCopy) {
+		const src = join(srcProfile, file);
+		const dest = join(destDir, file);
+		if (existsSync(src) && !existsSync(dest)) {
+			copyFileSync(src, dest);
+			imported.push(file);
+		}
+	}
+
+	return { imported };
+}
+
+/**
+ * Launch an isolated Chrome instance with its own user-data-dir.
+ * This is completely separate from the user's normal Chrome — no windows
+ * killed, no sessions touched. Uses ~/.pi/browser-data/ for persistence.
+ *
+ * Use a different CDP port (default 9223) to avoid conflicts if the user
+ * later starts their real Chrome with CDP on 9222.
+ */
+export async function launchIsolatedBrowser(opts: {
+	port?: number;
+	importFromProfile?: string;
+	binary?: string;
+} = {}): Promise<{ port: number; dataDir: string; cookiesImported: string[] }> {
+	const port = opts.port || 9223;
+	const dataDir = getPiBrowserDataDir();
+	const binary = opts.binary || findChromeBinary();
+	if (!binary) throw new Error("Chrome not found. Install Google Chrome or set --chrome-path.");
+
+	// Already running on this port?
+	if (await isDebugPortOpen(port)) {
+		return { port, dataDir, cookiesImported: [] };
+	}
+
+	// Import cookies if requested
+	let cookiesImported: string[] = [];
+	if (opts.importFromProfile) {
+		const result = importCookiesFromProfile(opts.importFromProfile);
+		cookiesImported = result.imported;
+	}
+
+	const args = [
+		`--remote-debugging-port=${port}`,
+		`--user-data-dir=${dataDir}`,
+		"--no-first-run",
+		"--no-default-browser-check",
+	];
+
+	const child = nodeSpawn(binary, args, {
+		detached: true,
+		stdio: "ignore",
+	});
+	child.unref();
+
+	const ready = await waitForCdp(port, 15000);
+	if (!ready) throw new Error(`Isolated browser launched but CDP port ${port} not responding.`);
+
+	return { port, dataDir, cookiesImported };
 }

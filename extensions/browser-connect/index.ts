@@ -30,6 +30,7 @@ import {
 	discoverProfiles,
 	isDebugPortOpen,
 	getCdpInfo,
+	launchIsolatedBrowser,
 	type ChromeProfile,
 } from "./chrome.js";
 import { run, runDirect, screenshotPath, isInstalled, install } from "./agent-browser.js";
@@ -119,18 +120,24 @@ export default function browserConnectExtension(pi: ExtensionAPI) {
 		label: "Browser Launch",
 		description: `Connect to the user's Chrome browser via CDP. Uses their real profile with all logged-in sessions.
 
-If Chrome is running without CDP: gracefully restarts it with debug port (all tabs restore).
-If Chrome isn't running: launches it with the specified profile.
+Two paths:
+1. **Restart Chrome** (recommended) — Gracefully restarts Chrome with debugging enabled. All tabs restore automatically. Gives full access to the user's real browser with all logins.
+2. **Separate browser** — Launches an isolated Chrome with imported cookies. User's real Chrome stays untouched. Some sessions may not transfer.
 
-Set a profile by display name ("Work"), directory name ("Profile 1"), or email.`,
+If Chrome isn't running, launches directly with CDP — no prompt needed.
+If CDP is already enabled, connects immediately.`,
 		parameters: Type.Object({
 			profile: Type.Optional(Type.String({
 				description: 'Chrome profile to use — display name ("Work"), dir name ("Profile 1"), or email. Omit for default profile.',
 			})),
 			port: Type.Optional(Type.Number({ description: "CDP port (default: 9222)" })),
+			mode: Type.Optional(Type.Union([
+				Type.Literal("restart"),
+				Type.Literal("isolated"),
+			], { description: "Skip the prompt: 'restart' to restart Chrome, 'isolated' to launch separate browser." })),
 		}),
-		async execute(_id, params) {
-			const { profile, port: portOverride } = params as { profile?: string; port?: number };
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const { profile, port: portOverride, mode } = params as { profile?: string; port?: number; mode?: "restart" | "isolated" };
 
 			// Check agent-browser is available
 			if (!isInstalled()) {
@@ -152,30 +159,79 @@ Set a profile by display name ("Work"), directory name ("Profile 1"), or email.`
 
 			let statusMsg = "";
 
+			// ── Case 1: CDP already open — just connect ──
 			if (info.debugPortOpen) {
-				// Already connected
 				cdpPort = port;
 				const cdpInfo = await getCdpInfo(port);
 				statusMsg = `Connected to existing Chrome (CDP port ${port}).`;
 				if (cdpInfo) statusMsg += `\nBrowser: ${cdpInfo.browser}`;
+
+			// ── Case 2: Chrome running without CDP — ask user ──
+			} else if (info.running) {
+				let chosenMode = mode;
+
+				if (!chosenMode) {
+					// Ask the user what they want to do
+					const restart = await ctx.ui.confirm(
+						"Browser Testing Setup",
+						"Chrome is running but doesn't have debugging enabled.\n\n" +
+						"Option 1 — Restart Chrome (recommended):\n" +
+						"I'll gracefully restart Chrome with debugging turned on. All your tabs, windows, " +
+						"and profiles will restore automatically — everything comes back exactly as it was.\n\n" +
+						"Option 2 — Separate browser:\n" +
+						"I'll launch an isolated browser and import your cookies. Your real Chrome stays open. " +
+						"Note: if you later need to connect to your real Chrome mid-session, that WILL require " +
+						"restarting it at that point. Chrome can restore your session, but you'll have to " +
+						"trigger it manually (Chrome → History → Restore tabs).\n\n" +
+						"Restart Chrome now?",
+					);
+					chosenMode = restart ? "restart" : "isolated";
+				}
+
+				if (chosenMode === "restart") {
+					// Path 1: Restart real Chrome with CDP
+					// Don't pass profileDirName — let session restore handle all profiles naturally
+					ctx.ui.notify("Restarting Chrome with debugging enabled...", "info");
+					const result = await ensureChromeWithCdp({
+						port,
+						binary: chromePath,
+					});
+					cdpPort = result.port;
+					statusMsg = `Restarted Chrome with CDP enabled (port ${port}). All profiles and tabs restored via session restore.`;
+				} else {
+					// Path 2: Launch isolated browser with cookie import
+					const importProfile = await pickProfileForImport(info.profiles, profileDir, ctx);
+					ctx.ui.notify("Launching separate browser...", "info");
+					const isoPort = port === 9222 ? 9223 : port; // avoid conflict with user's Chrome
+					const result = await launchIsolatedBrowser({
+						port: isoPort,
+						importFromProfile: importProfile || undefined,
+						binary: chromePath,
+					});
+					cdpPort = result.port;
+					statusMsg = `Launched separate browser with CDP (port ${result.port}).\n` +
+						`Data dir: ${result.dataDir}\n` +
+						`Your real Chrome is untouched.`;
+					if (result.cookiesImported.length > 0) {
+						statusMsg += `\nImported: ${result.cookiesImported.join(", ")}`;
+					} else if (importProfile) {
+						statusMsg += `\nCookies already imported from a previous session.`;
+					}
+				}
+
+			// ── Case 3: Chrome not running — launch directly ──
 			} else {
-				// Need to start or restart
 				const result = await ensureChromeWithCdp({
 					port,
 					profileDirName: profileDir,
 					binary: chromePath,
 				});
 				cdpPort = result.port;
-
-				if (result.restarted) {
-					statusMsg = `Restarted Chrome with CDP enabled (port ${port}). All tabs restored via session restore.`;
-				} else if (result.launched) {
-					statusMsg = `Launched Chrome with CDP enabled (port ${port}).`;
-				}
+				statusMsg = `Launched Chrome with CDP enabled (port ${port}).`;
 			}
 
 			// Connect agent-browser to the CDP port
-			const connectResult = await runDirect(["connect", String(port)], { timeout: 10 });
+			const connectResult = await runDirect(["connect", String(cdpPort)], { timeout: 10 });
 			if (connectResult.exitCode !== 0 && connectResult.stderr.trim()) {
 				statusMsg += `\nNote: ${connectResult.stderr.trim()}`;
 			}
@@ -195,6 +251,43 @@ Set a profile by display name ("Work"), directory name ("Profile 1"), or email.`
 			return { content: [{ type: "text", text: statusMsg }] };
 		},
 	});
+
+	/**
+	 * If no profile was explicitly requested, ask the user which profile
+	 * to import cookies from. Returns the profile dir name or null.
+	 */
+	async function pickProfileForImport(
+		profiles: ChromeProfile[],
+		explicitProfile: string | undefined,
+		ctx: { ui: { select: (title: string, options: string[]) => Promise<string | undefined> } },
+	): Promise<string | null> {
+		// If user already specified a profile, use that
+		if (explicitProfile) return explicitProfile;
+
+		// No profiles found
+		if (profiles.length === 0) return null;
+
+		// One profile — use it without asking
+		if (profiles.length === 1) return profiles[0].dirName;
+
+		// Multiple profiles — let user pick
+		const options = profiles.map(p => {
+			const email = p.email ? ` (${p.email})` : "";
+			return `${p.displayName}${email} [${p.dirName}]`;
+		});
+		options.push("Skip — don't import cookies");
+
+		const selected = await ctx.ui.select(
+			"Which Chrome profile should I import cookies from?",
+			options,
+		);
+
+		if (!selected || selected.startsWith("Skip")) return null;
+
+		// Extract dir name from "[Profile 1]" suffix
+		const match = selected.match(/\[(.+)\]$/);
+		return match ? match[1] : null;
+	}
 
 	// ─── browser_go ─────────────────────────────────────────────────────
 
