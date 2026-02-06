@@ -62,7 +62,7 @@ Then access via `https://<vmId>.vm.vers.sh:8080`.
 
 ## If the port doesn't work
 
-Only ports 3000 and 8080 are routed through the Vers proxy. Use one of those.
+Vers routes these ports: 80, 443, 3000, 3210, 3306, 3724, 5173, 8000, 8080, 9000, 9999, 1337. Use one of them.
 
 ## If you need HTTPS
 
