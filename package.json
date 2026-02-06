@@ -2,7 +2,9 @@
   "name": "@hdresearch/pi-v",
   "version": "0.1.0",
   "description": "Pi extensions and skills for Vers VM management, browser automation, background processes, and plan mode",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,5 +20,12 @@
     "skills": [
       "./skills"
     ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
   }
 }
