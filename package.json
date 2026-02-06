@@ -12,7 +12,6 @@
     "extensions": [
       "./extensions/background-process.ts",
       "./extensions/plan-mode/index.ts",
-      "./extensions/reader.ts",
       "./extensions/vers-swarm.ts",
       "./extensions/vers-vm.ts"
     ],
