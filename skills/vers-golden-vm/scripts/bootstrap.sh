@@ -36,7 +36,7 @@ echo "  pi $(pi --version)"
 # --- Git config ---
 echo "[4/6] Configuring git..."
 git config --global user.name "pi-agent"
-git config --global user.email "pi-agent@vers.sh"
+git config --global user.email "tynan.daly@hdr.is"
 git config --global init.defaultBranch main
 
 # --- Workspace and swarm directories ---
