@@ -92,6 +92,8 @@ function sshArgs(keyPath: string, vmId: string): string[] {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
 		"-o", "ConnectTimeout=30",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
 		"-o", `ProxyCommand=openssl s_client -connect %h:443 -servername %h -quiet 2>/dev/null`,
 		`root@${vmId}.vm.vers.sh`,
 	];
@@ -114,8 +116,14 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 }
 
 /**
- * Start pi in RPC mode on a VM via SSH.
- * Returns a handle to send commands and read events.
+ * Start pi in RPC mode on a VM as a **daemon** (detached from SSH).
+ *
+ * Architecture:
+ *   - pi runs in the background on the VM, reading from a FIFO and writing to a file
+ *   - A `sleep infinity` process keeps the FIFO open so pi never gets EOF
+ *   - Commands are sent via one-shot SSH writes to the FIFO
+ *   - Events are read via `tail -f` over SSH, which auto-reconnects on drop
+ *   - If the tail SSH drops, pi stays alive — we just reconnect
  */
 interface StartRpcOptions {
 	anthropicApiKey: string;
@@ -123,59 +131,141 @@ interface StartRpcOptions {
 	versBaseUrl?: string;
 }
 
-function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): {
+const RPC_DIR = "/tmp/pi-rpc";
+const RPC_IN = `${RPC_DIR}/in`;     // FIFO — commands written here
+const RPC_OUT = `${RPC_DIR}/out`;    // Regular file — pi writes JSON events here
+const RPC_ERR = `${RPC_DIR}/err`;    // Regular file — pi stderr
+const RPC_PID = `${RPC_DIR}/pi.pid`;
+const RPC_KEEPER_PID = `${RPC_DIR}/keeper.pid`;
+
+interface RpcHandle {
 	send: (cmd: object) => void;
 	onEvent: (handler: (event: any) => void) => void;
-	kill: () => void;
-	process: ReturnType<typeof spawn>;
-} {
-	const args = sshArgs(keyPath, vmId);
-	// Set env vars for LLM + Vers access, then start pi in RPC mode
-	const envVars = [
-		`export ANTHROPIC_API_KEY=${opts.anthropicApiKey}`,
-		opts.versApiKey ? `export VERS_API_KEY=${opts.versApiKey}` : "",
-		opts.versBaseUrl ? `export VERS_BASE_URL=${opts.versBaseUrl}` : "",
+	kill: () => Promise<void>;
+	vmId: string;
+}
+
+async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): Promise<RpcHandle> {
+	// Build env vars
+	const envExports = [
+		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
+		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
+		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
 	].filter(Boolean).join("; ");
-	const remoteCmd = `${envVars}; cd /root/workspace; pi --mode rpc --no-session`;
 
-	const child = spawn("ssh", [...args, remoteCmd], {
-		stdio: ["pipe", "pipe", "pipe"],
-	});
+	// Step 1: Start pi inside a tmux session on the VM.
+	// tmux survives SSH disconnects — if our tail -f drops, pi keeps running.
+	const startScript = `
+		set -e
+		mkdir -p ${RPC_DIR}
+		rm -f ${RPC_IN} ${RPC_OUT} ${RPC_ERR} ${RPC_PID} ${RPC_KEEPER_PID}
+		mkfifo ${RPC_IN}
+		touch ${RPC_OUT} ${RPC_ERR}
 
+		# Keep FIFO open so pi never gets EOF when a writer disconnects
+		tmux new-session -d -s pi-keeper "sleep infinity > ${RPC_IN}"
+
+		# Start pi in a tmux session, reading from FIFO, writing to file
+		tmux new-session -d -s pi-rpc "${envExports}; cd /root/workspace; pi --mode rpc --no-session < ${RPC_IN} >> ${RPC_OUT} 2>> ${RPC_ERR}"
+
+		# Wait a moment for processes to start
+		sleep 1
+
+		# Verify tmux sessions exist
+		tmux has-session -t pi-rpc 2>/dev/null && echo "daemon_started" || echo "daemon_failed"
+	`;
+
+	const startResult = await sshExec(keyPath, vmId, startScript);
+	if (!startResult.stdout.includes("daemon_started")) {
+		throw new Error(`Failed to start pi daemon on ${vmId}: ${startResult.stderr || startResult.stdout}`);
+	}
+
+	// Step 2: Start tail -f over SSH to read events (reconnectable)
 	let eventHandler: ((event: any) => void) | undefined;
+	let tailChild: ReturnType<typeof spawn> | null = null;
 	let lineBuf = "";
+	let killed = false;
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let linesProcessed = 0; // Track lines so we skip on reconnect
 
-	let stderrLog = "";
-	child.stderr.on("data", (d: Buffer) => { stderrLog += d.toString(); });
-	child.on("close", (code) => {
-		if (stderrLog) console.error(`[vers-swarm] pi RPC on ${vmId.slice(0, 12)} exited (code ${code}): ${stderrLog.slice(0, 500)}`);
-	});
+	function startTail() {
+		if (killed) return;
+		const args = sshArgs(keyPath, vmId);
+		// On reconnect, skip already-processed lines (+1 because tail is 1-indexed)
+		const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
+		tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 
-	child.stdout.on("data", (data: Buffer) => {
-		lineBuf += data.toString();
-		const lines = lineBuf.split("\n");
-		lineBuf = lines.pop() || "";
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			try {
-				const event = JSON.parse(line);
-				if (eventHandler) eventHandler(event);
-			} catch {
-				// not JSON, ignore
+		tailChild.stdout!.on("data", (data: Buffer) => {
+			lineBuf += data.toString();
+			const lines = lineBuf.split("\n");
+			lineBuf = lines.pop() || "";
+			for (const line of lines) {
+				linesProcessed++;
+				if (!line.trim()) continue;
+				try {
+					const event = JSON.parse(line);
+					if (eventHandler) eventHandler(event);
+				} catch {
+					// not JSON, ignore (tail noise, etc.)
+				}
 			}
+		});
+
+		tailChild.stderr!.on("data", (d: Buffer) => {
+			const msg = d.toString().trim();
+			if (msg) console.error(`[vers-swarm] tail stderr (${vmId.slice(0, 12)}): ${msg}`);
+		});
+
+		tailChild.on("close", (code) => {
+			if (killed) return;
+			console.error(`[vers-swarm] tail on ${vmId.slice(0, 12)} exited (code ${code}), reconnecting in 3s...`);
+			lineBuf = ""; // Reset partial line buffer on reconnect
+			// Reconnect after a delay — pi is still alive on the VM
+			reconnectTimer = setTimeout(() => startTail(), 3000);
+		});
+	}
+
+	startTail();
+
+	// Step 3: Send commands via one-shot SSH, piping JSON on stdin to the FIFO.
+	// No shell escaping needed — JSON goes straight through stdin.
+	function send(cmd: object) {
+		if (killed) return;
+		const json = JSON.stringify(cmd) + "\n";
+		const writeChild = spawn("ssh", [...sshArgs(keyPath, vmId), `cat > ${RPC_IN}`], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		writeChild.stdin.write(json);
+		writeChild.stdin.end();
+		writeChild.on("error", (err) => {
+			console.error(`[vers-swarm] send failed (${vmId.slice(0, 12)}): ${err.message}`);
+		});
+	}
+
+	// Step 4: Kill — stop pi and cleanup on the VM
+	async function kill() {
+		killed = true;
+		if (reconnectTimer) clearTimeout(reconnectTimer);
+		if (tailChild) {
+			try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
+			tailChild = null;
 		}
-	});
+		try {
+			await sshExec(keyPath, vmId, `
+				tmux kill-session -t pi-rpc 2>/dev/null || true
+				tmux kill-session -t pi-keeper 2>/dev/null || true
+				rm -rf ${RPC_DIR}
+			`);
+		} catch { /* VM might already be gone */ }
+	}
 
 	return {
-		send: (cmd: object) => {
-			child.stdin.write(JSON.stringify(cmd) + "\n");
-		},
+		send,
 		onEvent: (handler) => { eventHandler = handler; },
-		kill: () => {
-			child.stdin.end();
-			child.kill("SIGTERM");
-		},
-		process: child,
+		kill,
+		vmId,
 	};
 }
 
@@ -185,7 +275,7 @@ function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): {
 
 export default function versSwarmExtension(pi: ExtensionAPI) {
 	const agents = new Map<string, SwarmAgent>();
-	const rpcHandles = new Map<string, ReturnType<typeof startRpcAgent>>();
+	const rpcHandles = new Map<string, RpcHandle>();
 
 	function agentSummary(): string {
 		if (agents.size === 0) return "No agents in swarm.";
@@ -284,8 +374,8 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					await sshExec(keyPath, vmId, `mkdir -p /root/.swarm/status && echo '{"vms":[]}' > /root/.swarm/registry.json`);
 				}
 
-				// Start pi RPC agent with Vers credentials
-				const handle = startRpcAgent(keyPath, vmId, {
+				// Start pi RPC agent as daemon with Vers credentials
+				const handle = await startRpcAgent(keyPath, vmId, {
 					anthropicApiKey,
 					versApiKey,
 					versBaseUrl,
@@ -301,23 +391,32 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 				};
 
 				// Wait for pi RPC to be ready by sending get_state
+				// The daemon needs a few seconds to start + tail -f needs to connect
 				const rpcReady = await new Promise<boolean>((resolve) => {
-					const timeout = setTimeout(() => resolve(false), 30000);
+					let resolved = false;
+					const timeout = setTimeout(() => { if (!resolved) { resolved = true; resolve(false); } }, 45000);
 					handle.onEvent((event) => {
-						if (event.type === "response" && event.command === "get_state") {
+						if (!resolved && event.type === "response" && event.command === "get_state") {
+							resolved = true;
 							clearTimeout(timeout);
 							resolve(true);
 						}
 					});
-					// Give SSH + pi a moment to start
-					setTimeout(() => {
+					// Give daemon + tail time to start, then send check.
+					// Retry a few times in case the first send arrives before pi is ready.
+					let attempts = 0;
+					const trySend = () => {
+						if (resolved || attempts > 8) return;
+						attempts++;
 						handle.send({ id: "startup-check", type: "get_state" });
-					}, 2000);
+						setTimeout(trySend, 3000);
+					};
+					setTimeout(trySend, 3000);
 				});
 
 				if (!rpcReady) {
 					results.push(`${label}: VM ${vmId.slice(0, 12)} booted but pi RPC failed to start`);
-					handle.kill();
+					await handle.kill();
 					continue;
 				}
 
@@ -533,10 +632,10 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			const results: string[] = [];
 
 			for (const [id, agent] of agents) {
-				// Kill RPC process
+				// Kill RPC daemon on VM
 				const handle = rpcHandles.get(id);
 				if (handle) {
-					try { handle.kill(); } catch { /* ignore */ }
+					try { await handle.kill(); } catch { /* ignore */ }
 					rpcHandles.delete(id);
 				}
 
@@ -563,7 +662,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	// Clean up on session shutdown
 	pi.on("session_shutdown", async () => {
 		for (const handle of rpcHandles.values()) {
-			try { handle.kill(); } catch { /* ignore */ }
+			try { await handle.kill(); } catch { /* ignore */ }
 		}
 		rpcHandles.clear();
 	});

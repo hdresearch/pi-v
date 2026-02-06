@@ -11,8 +11,7 @@
   "pi": {
     "extensions": [
       "./extensions/background-process.ts",
-      "./extensions/browser",
-      "./extensions/plan-mode",
+      "./extensions/plan-mode/index.ts",
       "./extensions/vers-swarm.ts",
       "./extensions/vers-vm.ts"
     ],
