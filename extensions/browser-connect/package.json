@@ -1,0 +1,6 @@
+{
+  "name": "pi-browser-connect",
+  "version": "0.1.0",
+  "description": "Zero-friction Chrome browser control for pi agents via CDP",
+  "private": true
+}

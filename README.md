@@ -24,6 +24,7 @@ pi install git@github.com:hdresearch/pi-v.git
 |-----------|-------------|
 | `vers-vm` | Create, branch, commit, restore, and manage Vers VMs. Provides `vers_vm_*` tools. |
 | `vers-swarm` | Spawn and orchestrate agent swarms across branched VMs. Provides `vers_swarm_*` tools. |
+| `browser-connect` | Zero-friction Chrome control via CDP — uses your real browser, real sessions, real profile. No extension needed. |
 | `browser` | Headless Chrome browser automation (navigate, click, type, screenshot, eval). |
 | `background-process` | Run and manage long-lived background processes (dev servers, watchers). |
 | `plan-mode` | Structured plan-then-execute workflow mode. |
