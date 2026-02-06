@@ -287,6 +287,18 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 		return `Swarm (${agents.size} agents):\n${lines.join("\n")}`;
 	}
 
+	/** Format a compact summary of an agent's result — truncated output to save context */
+	function formatAgentSummary(a: SwarmAgent): string {
+		const MAX_SUMMARY_OUTPUT = 500; // chars of output to include in summary
+		let preview = a.lastOutput || "(no output)";
+		const fullLen = preview.length;
+		if (preview.length > MAX_SUMMARY_OUTPUT) {
+			preview = preview.slice(-MAX_SUMMARY_OUTPUT);
+			preview = `[...${fullLen - MAX_SUMMARY_OUTPUT} chars truncated...]\n${preview}`;
+		}
+		return `=== ${a.id} [${a.status}] (${a.vmId.slice(0, 12)}) | ${fullLen} chars total ===\n${preview}`;
+	}
+
 	function updateWidget(ctx?: { ui: { setWidget: (key: string, lines: string[] | undefined) => void } }) {
 		if (!ctx) return;
 		if (agents.size === 0) {
@@ -491,7 +503,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "vers_swarm_wait",
 		label: "Wait for Agents",
-		description: "Block until all agents (or specified agents) finish. Returns each agent's full text output. Use after dispatching tasks to collect results without polling.",
+		description: "Block until all agents (or specified agents) finish. Returns a summary of each agent's status and output (truncated). Use vers_swarm_read to get full output from individual agents.",
 		parameters: Type.Object({
 			agentIds: Type.Optional(Type.Array(Type.String(), { description: "Specific agent IDs to wait for (default: all working/idle agents)" })),
 			timeoutSeconds: Type.Optional(Type.Number({ description: "Max seconds to wait (default: 300)" })),
@@ -509,15 +521,15 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			});
 
 			if (waiting.length === 0) {
-				// All already done, return results immediately
+				// All already done, return summaries
 				const results: string[] = [];
 				for (const id of targetIds) {
 					const a = agents.get(id);
 					if (!a) continue;
-					results.push(`=== ${id} [${a.status}] ===\n${a.lastOutput || "(no output)"}\n`);
+					results.push(formatAgentSummary(a));
 				}
 				return {
-					content: [{ type: "text", text: results.join("\n") }],
+					content: [{ type: "text", text: `All agents already done.\n\n${results.join("\n")}\n\nUse vers_swarm_read for full output.` }],
 					details: { waited: 0, agents: targetIds },
 				};
 			}
@@ -550,7 +562,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			for (const id of targetIds) {
 				const a = agents.get(id);
 				if (!a) continue;
-				results.push(`=== ${id} [${a.status}] ===\n${a.lastOutput || "(no output)"}\n`);
+				results.push(formatAgentSummary(a));
 			}
 
 			if (ctx) updateWidget(ctx);
@@ -563,7 +575,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text",
-					text: `${timedOut ? "TIMED OUT after" : "All agents finished in"} ${elapsed}s\n\n${results.join("\n")}`,
+					text: `${timedOut ? "TIMED OUT after" : "All agents finished in"} ${elapsed}s\n\n${results.join("\n")}\n\nUse vers_swarm_read for full output from any agent.`,
 				}],
 				details: { elapsed, timedOut, agents: targetIds },
 			};
@@ -599,10 +611,10 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "vers_swarm_read",
 		label: "Read Agent Output",
-		description: "Read the latest text output from a specific swarm agent. Returns the agent's accumulated response text.",
+		description: "Read the latest text output from a specific swarm agent. Returns the last 5000 chars by default to save context. Pass tail=0 for full output.",
 		parameters: Type.Object({
 			agentId: Type.String({ description: "Agent label/ID to read from" }),
-			tail: Type.Optional(Type.Number({ description: "Number of characters from the end to return (default: all)" })),
+			tail: Type.Optional(Type.Number({ description: "Number of characters from the end to return (default: 5000). Pass 0 for full output." })),
 		}),
 		async execute(_id, params) {
 			const { agentId, tail } = params as { agentId: string; tail?: number };
@@ -611,13 +623,16 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			if (!agent) throw new Error(`Agent '${agentId}' not found. Available: ${Array.from(agents.keys()).join(", ")}`);
 
 			let output = agent.lastOutput || "(no output yet)";
-			if (tail && output.length > tail) {
-				output = "..." + output.slice(-tail);
+			const fullLength = output.length;
+			// Default to 5000 chars to keep context manageable; tail=0 means full output
+			const effectiveTail = tail === 0 ? undefined : (tail || 5000);
+			if (effectiveTail && output.length > effectiveTail) {
+				output = `[...${fullLength - effectiveTail} chars truncated, showing last ${effectiveTail}...]\n` + output.slice(-effectiveTail);
 			}
 
 			return {
-				content: [{ type: "text", text: `[${agentId}] (${agent.status}):\n\n${output}` }],
-				details: { agentId, status: agent.status, outputLength: agent.lastOutput.length },
+				content: [{ type: "text", text: `[${agentId}] (${agent.status}) — ${fullLength} chars total:\n\n${output}` }],
+				details: { agentId, status: agent.status, outputLength: fullLength },
 			};
 		},
 	});
