@@ -250,6 +250,12 @@ export default function versVmExtension(pi: ExtensionAPI) {
 		default: "",
 	});
 
+	pi.registerFlag("vers-ssh-timeout", {
+		description: "Default timeout in seconds for remote SSH commands (default: 120). Set to 0 for no timeout.",
+		type: "number",
+		default: 120,
+	});
+
 	let client: VersClient | undefined;
 	let activeVmId: string | undefined;
 
@@ -428,10 +434,10 @@ export default function versVmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
-		description: "Execute a bash command. When a Vers VM is active, executes on the VM via SSH. Otherwise executes locally.",
+		description: "Execute a bash command. When a Vers VM is active, executes on the VM via SSH (default timeout: 120s, configurable via --vers-ssh-timeout). Otherwise executes locally.",
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),
-			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional)" })),
+			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds. Remote default: 120s (--vers-ssh-timeout). Pass 0 for no timeout." })),
 		}),
 		async execute(_id, params, signal, onUpdate) {
 			const { command, timeout } = params as { command: string; timeout?: number };
@@ -442,6 +448,10 @@ export default function versVmExtension(pi: ExtensionAPI) {
 			}
 
 			// Remote: stream via SSH
+			// Use explicit timeout if provided, otherwise fall back to the configured default
+			const defaultTimeout = pi.getFlag("vers-ssh-timeout") as number;
+			const effectiveTimeout = timeout !== undefined ? timeout : (defaultTimeout > 0 ? defaultTimeout : undefined);
+
 			const chunks: Buffer[] = [];
 			let totalBytes = 0;
 
@@ -459,7 +469,7 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				const result = await getClient().execStreaming(activeVmId, command, {
 					onData: handleData,
 					signal,
-					timeout,
+					timeout: effectiveTimeout,
 				});
 
 				const output = Buffer.concat(chunks).toString("utf-8") || "(no output)";
@@ -471,7 +481,16 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: output }], details: {} };
 			} catch (err: any) {
 				if (err.message === "aborted") throw new Error("Command aborted");
-				if (err.message.startsWith("timeout:")) throw new Error(`Command timed out after ${timeout} seconds`);
+				if (err.message.startsWith("timeout:")) {
+					const partialOutput = Buffer.concat(chunks).toString("utf-8");
+					const hint = effectiveTimeout === defaultTimeout
+						? ` (default --vers-ssh-timeout=${defaultTimeout}s). Pass a larger timeout parameter or use 0 to disable.`
+						: `s.`;
+					throw new Error(
+						`SSH command timed out after ${effectiveTimeout}${hint}` +
+						(partialOutput ? `\n\nPartial output:\n${partialOutput.slice(-5000)}` : "")
+					);
+				}
 				throw err;
 			}
 		},
