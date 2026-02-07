@@ -36,9 +36,19 @@ pi install git@github.com:hdresearch/pi-v.git
 | `vers-platform-development` | Guidelines for Vers platform development and issue reporting. |
 | `investigate-vers-issue` | Deep investigation and debugging of Vers platform issues. |
 
-### Providers
+### Swarm Providers
 
-Swarm agents (`vers-swarm` extension) can run on any LLM provider supported by pi — not just Anthropic. Configure agents to use ZAI/GLM, Google, OpenAI, Azure, or other providers when spawning.
+Swarm agents can run on any LLM provider supported by pi. When spawning a swarm, pass the `provider` and `apiKey` parameters:
+
+| Provider | Name | Env Var | Example Model |
+|----------|------|---------|---------------|
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
+| ZAI/GLM | `zai` | `ZAI_API_KEY` | `glm-4.7` |
+| Google | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| Azure | `azure` | `AZURE_OPENAI_API_KEY` | — |
+
+If no provider is specified, defaults to `anthropic`. Any provider not in this list will use `{PROVIDER_NAME}_API_KEY` as the env var.
 
 ## Dependencies
 
@@ -48,3 +58,4 @@ The `browser` extension requires `puppeteer`. After installing the package, run:
 cd ~/.pi/agent/git/github.com/hdresearch/pi-v/extensions/browser
 npm install
 ```
+
