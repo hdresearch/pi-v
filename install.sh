@@ -41,7 +41,7 @@ info "Installing pi-v package from $REPO..."
 pi install "$REPO"
 
 # -----------------------------------------------------------
-# 4. Install extension dependencies (browser/puppeteer)
+# 4. Install extension dependencies
 # -----------------------------------------------------------
 PI_V_DIR="$HOME/.pi/agent/git/github.com/hdresearch/pi-v"
 
@@ -51,16 +51,20 @@ if [ -d "$PI_V_DIR/extensions/browser" ]; then
 fi
 
 # -----------------------------------------------------------
-# Done
+# Done — list what was actually installed
 # -----------------------------------------------------------
 info "Done! Restart pi or run /reload to pick up the new extensions."
+
 printf "\n  Extensions:\n"
-printf "    • vers-vm        — Vers VM management\n"
-printf "    • vers-swarm     — Agent swarm orchestration\n"
-printf "    • browser        — Headless Chrome automation\n"
-printf "    • background-process — Long-lived process management\n"
-printf "    • plan-mode      — Read-only exploration mode\n"
+for ext in "$PI_V_DIR"/extensions/*; do
+  [ -e "$ext" ] || continue
+  name=$(basename "$ext" .ts)
+  printf "    • %s\n" "$name"
+done
+
 printf "\n  Skills:\n"
-printf "    • vers-golden-vm\n"
-printf "    • vers-platform-development\n"
-printf "    • investigate-vers-issue\n\n"
+for skill in "$PI_V_DIR"/skills/*; do
+  [ -d "$skill" ] || continue
+  printf "    • %s\n" "$(basename "$skill")"
+done
+printf "\n"

@@ -19,6 +19,7 @@
  *   vers_vm_state     - Pause or resume a VM
  *   vers_vm_use       - Set the active VM (routes read/bash/edit/write to it)
  *   vers_vm_local     - Switch back to local execution
+ *   vers_vm_copy      - Copy files between local machine and VM via SCP
  *
  * Overrides (when a VM is active):
  *   read, bash, edit, write — routed through SSH to the active VM
@@ -162,6 +163,43 @@ class VersClient {
 			"-o", `ProxyCommand=openssl s_client -connect %h:443 -servername %h -quiet 2>/dev/null`,
 			`root@${hostname}`,
 		];
+	}
+
+	/** Base SCP args for a VM (SSH-over-TLS via openssl ProxyCommand) */
+	async scpArgs(vmId: string): Promise<{ baseArgs: string[]; hostname: string }> {
+		const keyPath = await this.ensureKeyFile(vmId);
+		const hostname = `${vmId}.vm.vers.sh`;
+		const baseArgs = [
+			"-i", keyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "LogLevel=ERROR",
+			"-o", "ConnectTimeout=30",
+			"-o", `ProxyCommand=openssl s_client -connect %h:443 -servername %h -quiet 2>/dev/null`,
+		];
+		return { baseArgs, hostname };
+	}
+
+	/** Copy files to/from a VM via SCP */
+	async scp(vmId: string, src: string, dst: string, toVm: boolean): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		const { baseArgs, hostname } = await this.scpArgs(vmId);
+		const remote = (path: string) => `root@${hostname}:${path}`;
+		const args = [
+			...baseArgs,
+			"-r",
+			toVm ? src : remote(src),
+			toVm ? remote(dst) : dst,
+		];
+		return new Promise((resolve, reject) => {
+			execFile("scp", args, { maxBuffer: 10 * 1024 * 1024, timeout: 300000 }, (err, stdout, stderr) => {
+				if (err && typeof (err as any).code === "string") {
+					reject(new Error(`SCP failed: ${err.message}`));
+					return;
+				}
+				const exitCode = (err as any)?.status ?? (err ? 1 : 0);
+				resolve({ stdout: stdout?.toString() ?? "", stderr: stderr?.toString() ?? "", exitCode });
+			});
+		});
 	}
 
 	/** Execute a command on a VM via SSH, return stdout/stderr/exitCode */
@@ -416,6 +454,41 @@ export default function versVmExtension(pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: prev ? `Switched from VM ${prev} back to local execution.` : "Already in local mode." }],
 				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "vers_vm_copy",
+		label: "Copy to/from Vers VM",
+		description: "Copy files between local machine and a Vers VM via SCP. Copies recursively for directories. Uses the active VM if vmId is not specified.",
+		parameters: Type.Object({
+			vmId: Type.Optional(Type.String({ description: "VM ID (defaults to active VM)" })),
+			localPath: Type.String({ description: "Local file or directory path" }),
+			remotePath: Type.String({ description: "Remote file or directory path on the VM" }),
+			direction: Type.Union([Type.Literal("to_vm"), Type.Literal("from_vm")], {
+				description: "'to_vm' copies local->VM, 'from_vm' copies VM->local",
+			}),
+		}),
+		async execute(_id, params) {
+			const { localPath, remotePath, direction } = params as {
+				vmId?: string; localPath: string; remotePath: string; direction: "to_vm" | "from_vm";
+			};
+			const vmId = (params as any).vmId || activeVmId;
+			if (!vmId) throw new Error("No VM specified and no active VM. Use vers_vm_use first or pass vmId.");
+
+			const toVm = direction === "to_vm";
+			const absLocal = isAbsolute(localPath) ? localPath : resolve(process.cwd(), localPath);
+
+			const result = await getClient().scp(vmId, toVm ? absLocal : remotePath, toVm ? remotePath : absLocal, toVm);
+			if (result.exitCode !== 0) {
+				throw new Error(`SCP failed (exit ${result.exitCode}): ${result.stderr}`);
+			}
+
+			const arrow = toVm ? "->" : "<-";
+			return {
+				content: [{ type: "text", text: `Copied: ${absLocal} ${arrow} ${vmId.slice(0, 12)}:${remotePath}` }],
+				details: { vmId, localPath: absLocal, remotePath, direction },
 			};
 		},
 	});
