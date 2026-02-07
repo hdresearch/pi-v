@@ -23,7 +23,7 @@ pi install git@github.com:hdresearch/pi-v.git
 | Extension | Description |
 |-----------|-------------|
 | `vers-vm` | Create, branch, commit, restore, and manage Vers VMs. Provides `vers_vm_*` tools. |
-| `vers-swarm` | Spawn and orchestrate agent swarms across branched VMs. Provides `vers_swarm_*` tools. |
+| `vers-swarm` | Spawn and orchestrate agent swarms across branched VMs. Supports multiple LLM providers (Anthropic, ZAI/GLM, Google, OpenAI, Azure). Provides `vers_swarm_*` tools. |
 | `browser` | Headless Chrome browser automation (navigate, click, type, screenshot, eval). |
 | `background-process` | Run and manage long-lived background processes (dev servers, watchers). |
 | `plan-mode` | Structured plan-then-execute workflow mode. |
@@ -35,6 +35,10 @@ pi install git@github.com:hdresearch/pi-v.git
 | `vers-golden-vm` | Bootstrap a Vers VM into a golden image with pi, Node.js, and dev tools. |
 | `vers-platform-development` | Guidelines for Vers platform development and issue reporting. |
 | `investigate-vers-issue` | Deep investigation and debugging of Vers platform issues. |
+
+### Providers
+
+Swarm agents (`vers-swarm` extension) can run on any LLM provider supported by pi — not just Anthropic. Configure agents to use ZAI/GLM, Google, OpenAI, Azure, or other providers when spawning.
 
 ## Dependencies
 
