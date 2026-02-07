@@ -35,6 +35,11 @@ pi install git@github.com:hdresearch/pi-v.git
 | `vers-golden-vm` | Bootstrap a Vers VM into a golden image with pi, Node.js, and dev tools. |
 | `vers-platform-development` | Guidelines for Vers platform development and issue reporting. |
 | `investigate-vers-issue` | Deep investigation and debugging of Vers platform issues. |
+| `contribute-fix` | Contribute bug fixes back to pi-v via fork/PR or issue. |
+
+## Contributing
+
+Found a bug? Have a fix? See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome via the standard fork workflow.
 
 ## Dependencies
 
