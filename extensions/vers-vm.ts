@@ -75,20 +75,26 @@ function loadVersKeyFromDisk(): string {
 }
 
 class VersClient {
-	private apiKey: string;
+	private explicitApiKey: string | undefined;
 	private baseURL: string;
 	private sshKeyCache = new Map<string, VmSSHKeyResponse>();
 	private keyPathCache = new Map<string, string>();
 
 	constructor(opts: VersClientOptions = {}) {
-		this.apiKey = opts.apiKey || process.env.VERS_API_KEY || loadVersKeyFromDisk() || "";
+		this.explicitApiKey = opts.apiKey || undefined;
 		this.baseURL = (opts.baseURL || process.env.VERS_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
+	}
+
+	/** Resolve the API key fresh each time — picks up keys added after session start */
+	private resolveApiKey(): string {
+		return this.explicitApiKey || process.env.VERS_API_KEY || loadVersKeyFromDisk() || "";
 	}
 
 	private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
 		const url = `${this.baseURL}${path}`;
 		const headers: Record<string, string> = { "Content-Type": "application/json" };
-		if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+		const apiKey = this.resolveApiKey();
+		if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
 		const res = await fetch(url, {
 			method,
