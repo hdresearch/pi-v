@@ -110,6 +110,20 @@ curl -X POST https://{infraVmId}.vm.vers.sh:3000/registry/vms \
 curl https://{infraVmId}.vm.vers.sh:3000/registry/discover/worker
 ```
 
+## Security
+
+**All ports are public by default.** There is no firewall. Any service you start is reachable by anyone on the internet. Always protect services with authentication.
+
+For vers-agent-services, set `VERS_AUTH_TOKEN` env var. All endpoints except `/health` will require `Authorization: Bearer <token>`. Pass the same token to worker VMs so they can authenticate.
+
+```bash
+# Start with auth
+VERS_AUTH_TOKEN=$(openssl rand -hex 32) PORT=3000 node dist/server.js
+
+# Authenticated request
+curl -H "Authorization: Bearer $TOKEN" https://{vmId}.vm.vers.sh:3000/board/tasks
+```
+
 ## Common Mistakes
 
 1. **Binding to `0.0.0.0` instead of `::`** — The proxy routes via IPv6. IPv4-only services won't be reachable through the public URL (but will work locally on the VM).
