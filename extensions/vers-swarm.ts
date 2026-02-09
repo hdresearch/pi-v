@@ -10,6 +10,7 @@
  *   vers_swarm_status   - Check status of all agents
  *   vers_swarm_read     - Read an agent's latest output
  *   vers_swarm_wait     - Block until all/specified agents finish, return results
+ *   vers_swarm_discover - Discover and reconnect to running swarm agents from registry
  *   vers_swarm_teardown - Destroy all swarm VMs
  */
 
@@ -115,6 +116,67 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 	});
 }
 
+// =============================================================================
+// Registry helpers (coordination service)
+// =============================================================================
+
+interface RegistryEntry {
+	id: string;
+	name: string;
+	role: string;
+	address: string;
+	registeredBy: string;
+	metadata?: Record<string, unknown>;
+}
+
+async function registryPost(entry: RegistryEntry): Promise<void> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return;
+	try {
+		await fetch(`${infraUrl}/registry/vms`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${authToken}`,
+			},
+			body: JSON.stringify(entry),
+		});
+	} catch { /* best effort */ }
+}
+
+async function registryDelete(vmId: string): Promise<void> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return;
+	try {
+		await fetch(`${infraUrl}/registry/vms/${encodeURIComponent(vmId)}`, {
+			method: "DELETE",
+			headers: {
+				"Authorization": `Bearer ${authToken}`,
+			},
+		});
+	} catch { /* best effort */ }
+}
+
+async function registryList(): Promise<RegistryEntry[]> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return [];
+	try {
+		const res = await fetch(`${infraUrl}/registry/vms`, {
+			method: "GET",
+			headers: {
+				"Authorization": `Bearer ${authToken}`,
+			},
+		});
+		if (!res.ok) return [];
+		return (await res.json()) as RegistryEntry[];
+	} catch {
+		return [];
+	}
+}
+
 /**
  * Start pi in RPC mode on a VM as a **daemon** (detached from SSH).
  *
@@ -151,6 +213,8 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
+		process.env.VERS_INFRA_URL ? `export VERS_INFRA_URL='${process.env.VERS_INFRA_URL}'` : "",
+		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
 	].filter(Boolean).join("; ");
 
 	// Step 1: Start pi inside a tmux session on the VM.
@@ -442,6 +506,17 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 				agents.set(label, agent);
 				rpcHandles.set(label, handle);
+
+				// Register agent in coordination registry (best effort)
+				await registryPost({
+					id: vmId,
+					name: label,
+					role: "worker",
+					address: `${vmId}.vm.vers.sh`,
+					registeredBy: "vers-swarm",
+					metadata: { agentId: label, commitId, parentSession: true },
+				});
+
 				results.push(`${label}: VM ${vmId.slice(0, 12)} — ready`);
 			}
 
@@ -639,6 +714,9 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					rpcHandles.delete(id);
 				}
 
+				// Deregister from coordination registry (best effort)
+				await registryDelete(agent.vmId);
+
 				// Delete VM
 				try {
 					await versApi("DELETE", `/vm/${encodeURIComponent(agent.vmId)}`);
@@ -657,6 +735,220 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+	});
+
+	// --- Reconnection logic (shared by discover tool and session_start) ---
+
+	async function reconnectFromRegistry(ctx?: { ui: { setWidget: (key: string, lines: string[] | undefined) => void } }): Promise<string[]> {
+		const entries = await registryList();
+		const swarmEntries = entries.filter(
+			(e) => e.registeredBy === "vers-swarm" && e.metadata?.parentSession === true
+		);
+
+		if (swarmEntries.length === 0) return ["No swarm agents found in registry."];
+
+		const results: string[] = [];
+
+		for (const entry of swarmEntries) {
+			const vmId = entry.id;
+			const label = (entry.metadata?.agentId as string) || entry.name;
+
+			// Skip if already tracked locally
+			if (agents.has(label)) {
+				results.push(`${label}: already connected`);
+				continue;
+			}
+
+			try {
+				// Get SSH key for the VM
+				const keyPath = await ensureKeyFile(vmId);
+
+				// Check if pi-rpc tmux session is still running
+				const check = await sshExec(keyPath, vmId, "tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead");
+				if (!check.stdout.includes("alive")) {
+					results.push(`${label}: VM ${vmId.slice(0, 12)} — pi-rpc session not running, skipping`);
+					continue;
+				}
+
+				// Re-establish tail -f on the RPC output (reconnect event stream)
+				// We create a lightweight RpcHandle that just tails and sends — pi is already running
+				let eventHandler: ((event: any) => void) | undefined;
+				let tailChild: ReturnType<typeof spawn> | null = null;
+				let lineBuf = "";
+				let killed = false;
+				let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+				// Start from end — we don't want old events, just new ones
+				let linesProcessed = 0;
+
+				// Count existing lines so we skip them
+				const wcResult = await sshExec(keyPath, vmId, `wc -l < ${RPC_OUT} 2>/dev/null || echo 0`);
+				const existingLines = parseInt(wcResult.stdout.trim(), 10) || 0;
+				linesProcessed = existingLines;
+
+				function startTail() {
+					if (killed) return;
+					const args = sshArgs(keyPath, vmId);
+					const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
+					tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
+						stdio: ["ignore", "pipe", "pipe"],
+					});
+
+					tailChild.stdout!.on("data", (data: Buffer) => {
+						lineBuf += data.toString();
+						const lines = lineBuf.split("\n");
+						lineBuf = lines.pop() || "";
+						for (const line of lines) {
+							linesProcessed++;
+							if (!line.trim()) continue;
+							try {
+								const event = JSON.parse(line);
+								if (eventHandler) eventHandler(event);
+							} catch { /* not JSON */ }
+						}
+					});
+
+					tailChild.stderr!.on("data", (d: Buffer) => {
+						const msg = d.toString().trim();
+						if (msg) console.error(`[vers-swarm] tail stderr (${vmId.slice(0, 12)}): ${msg}`);
+					});
+
+					tailChild.on("close", (code) => {
+						if (killed) return;
+						console.error(`[vers-swarm] tail on ${vmId.slice(0, 12)} exited (code ${code}), reconnecting in 3s...`);
+						lineBuf = "";
+						reconnectTimer = setTimeout(() => startTail(), 3000);
+					});
+				}
+
+				startTail();
+
+				function send(cmd: object) {
+					if (killed) return;
+					const json = JSON.stringify(cmd) + "\n";
+					const writeChild = spawn("ssh", [...sshArgs(keyPath, vmId), `cat > ${RPC_IN}`], {
+						stdio: ["pipe", "pipe", "pipe"],
+					});
+					writeChild.stdin.write(json);
+					writeChild.stdin.end();
+					writeChild.on("error", (err) => {
+						console.error(`[vers-swarm] send failed (${vmId.slice(0, 12)}): ${err.message}`);
+					});
+				}
+
+				async function kill() {
+					killed = true;
+					if (reconnectTimer) clearTimeout(reconnectTimer);
+					if (tailChild) {
+						try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
+						tailChild = null;
+					}
+					try {
+						await sshExec(keyPath, vmId, `
+							tmux kill-session -t pi-rpc 2>/dev/null || true
+							tmux kill-session -t pi-keeper 2>/dev/null || true
+							rm -rf ${RPC_DIR}
+						`);
+					} catch { /* VM might already be gone */ }
+				}
+
+				const handle: RpcHandle = { send, onEvent: (h) => { eventHandler = h; }, kill, vmId };
+
+				// Probe agent state to confirm RPC is alive
+				const probeOk = await new Promise<boolean>((resolve) => {
+					let resolved = false;
+					const timeout = setTimeout(() => { if (!resolved) { resolved = true; resolve(false); } }, 15000);
+					handle.onEvent((event) => {
+						if (!resolved && event.type === "response" && event.command === "get_state") {
+							resolved = true;
+							clearTimeout(timeout);
+							resolve(true);
+						}
+					});
+					handle.send({ id: "reconnect-check", type: "get_state" });
+					// Retry once after 3s
+					setTimeout(() => {
+						if (!resolved) handle.send({ id: "reconnect-check-2", type: "get_state" });
+					}, 3000);
+				});
+
+				if (!probeOk) {
+					killed = true;
+					if (tailChild) { try { tailChild.kill("SIGTERM"); } catch { /* ignore */ } }
+					results.push(`${label}: VM ${vmId.slice(0, 12)} — pi-rpc alive but RPC probe failed, skipping`);
+					continue;
+				}
+
+				// Set up event handler for ongoing tracking
+				const agent: SwarmAgent = {
+					id: label,
+					vmId,
+					label,
+					status: "idle",
+					lastOutput: "",
+					events: [],
+				};
+
+				handle.onEvent((event) => {
+					agent.events.push(JSON.stringify(event));
+					if (agent.events.length > 200) agent.events.shift();
+					if (event.type === "agent_start") agent.status = "working";
+					else if (event.type === "agent_end") agent.status = "done";
+					else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+						agent.lastOutput += event.assistantMessageEvent.delta;
+					}
+				});
+
+				agents.set(label, agent);
+				rpcHandles.set(label, handle);
+				results.push(`${label}: VM ${vmId.slice(0, 12)} — reconnected`);
+			} catch (err) {
+				results.push(`${label}: VM ${vmId.slice(0, 12)} — reconnect failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+
+		if (ctx) updateWidget(ctx);
+		return results;
+	}
+
+	// --- vers_swarm_discover ---
+	pi.registerTool({
+		name: "vers_swarm_discover",
+		label: "Discover Swarm Agents",
+		description: "Discover running swarm agents from the registry and reconnect to them. Use after session restart to recover swarm state.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const infraUrl = process.env.VERS_INFRA_URL;
+			const authToken = process.env.VERS_AUTH_TOKEN;
+			if (!infraUrl || !authToken) {
+				return {
+					content: [{ type: "text", text: "Cannot discover agents: VERS_INFRA_URL and VERS_AUTH_TOKEN environment variables are required." }],
+					details: {},
+				};
+			}
+
+			const results = await reconnectFromRegistry(ctx);
+
+			return {
+				content: [{ type: "text", text: `Discovery results:\n${results.join("\n")}\n\n${agentSummary()}` }],
+				details: { discovered: results.length, agents: Array.from(agents.values()).map(a => ({ id: a.id, vmId: a.vmId, status: a.status })) },
+			};
+		},
+	});
+
+	// Auto-discover on session start
+	pi.on("session_start", async (_event, ctx) => {
+		const infraUrl = process.env.VERS_INFRA_URL;
+		const authToken = process.env.VERS_AUTH_TOKEN;
+		if (infraUrl && authToken) {
+			try {
+				const results = await reconnectFromRegistry(ctx);
+				if (results.some(r => r.includes("reconnected"))) {
+					console.error(`[vers-swarm] Auto-discovered agents: ${results.filter(r => r.includes("reconnected")).length} reconnected`);
+				}
+			} catch (err) {
+				console.error(`[vers-swarm] Auto-discover failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
 	});
 
 	// Clean up on session shutdown
