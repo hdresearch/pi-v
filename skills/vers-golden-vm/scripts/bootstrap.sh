@@ -39,6 +39,14 @@ git config --global user.name "pi-agent"
 git config --global user.email "tynan.daly@hdr.is"
 git config --global init.defaultBranch main
 
+# Prevent agents from getting stuck in interactive editors
+git config --global core.editor "true"
+export GIT_EDITOR=true
+echo 'export GIT_EDITOR=true' >> /root/.bashrc
+
+# Auto-accept merge messages (don't open editor for merge commits)
+git config --global merge.commit no-edit
+
 # --- Workspace and swarm directories ---
 echo "[5/6] Setting up directories..."
 mkdir -p /root/workspace
