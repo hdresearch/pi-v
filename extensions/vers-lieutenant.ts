@@ -18,9 +18,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 // =============================================================================
 // Types
@@ -249,12 +250,169 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 }
 
 // =============================================================================
+// Persistence — save/load lieutenant state to ~/.pi/lieutenants.json
+// =============================================================================
+
+interface PersistedLieutenant {
+	name: string;
+	role: string;
+	vmId: string;
+	status: string;
+	taskCount: number;
+	createdAt: string;
+	lastActivityAt: string;
+}
+
+interface PersistedState {
+	lieutenants: PersistedLieutenant[];
+	savedAt: string;
+}
+
+const STATE_PATH = join(homedir(), ".pi", "lieutenants.json");
+
+async function saveState(lieutenants: Map<string, Lieutenant>): Promise<void> {
+	const state: PersistedState = {
+		lieutenants: Array.from(lieutenants.values()).map(lt => ({
+			name: lt.name,
+			role: lt.role,
+			vmId: lt.vmId,
+			status: lt.status,
+			taskCount: lt.taskCount,
+			createdAt: lt.createdAt,
+			lastActivityAt: lt.lastActivityAt,
+		})),
+		savedAt: new Date().toISOString(),
+	};
+	await mkdir(join(homedir(), ".pi"), { recursive: true });
+	await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+}
+
+async function loadState(): Promise<PersistedLieutenant[]> {
+	try {
+		const data = await readFile(STATE_PATH, "utf-8");
+		const state = JSON.parse(data) as PersistedState;
+		return state.lieutenants || [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Reconnect to an existing lieutenant VM. Unlike startRpcAgent, this does NOT
+ * start a new pi daemon — it assumes pi is already running in tmux on the VM.
+ * We just need to:
+ *   1. Get SSH key
+ *   2. Verify tmux pi-rpc session exists
+ *   3. Start tail -f on the output file (from end — skip old output)
+ *   4. Return an RpcHandle for sending commands
+ */
+async function reconnectRpcAgent(vmId: string): Promise<RpcHandle> {
+	const keyPath = await ensureKeyFile(vmId);
+
+	// Verify pi is still running
+	const check = await sshExec(keyPath, vmId, "tmux has-session -t pi-rpc 2>/dev/null && echo ok || echo gone");
+	if (!check.stdout.includes("ok")) {
+		throw new Error(`Pi RPC session not found on VM ${vmId}. It may have crashed.`);
+	}
+
+	let eventHandler: ((event: any) => void) | undefined;
+	let tailChild: ReturnType<typeof spawn> | null = null;
+	let lineBuf = "";
+	let killed = false;
+	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	// Start from end of file — we don't replay old output on reconnect
+	let linesProcessed = -1; // sentinel: use tail -f -n 0 (new lines only)
+
+	function startTail() {
+		if (killed) return;
+		const args = sshArgs(keyPath, vmId);
+		// -n 0 on first connect (skip old output), -n +N on reconnect
+		const tailArg = linesProcessed < 0 ? "-n 0" : `-n +${linesProcessed + 1}`;
+		tailChild = spawn("ssh", [...args, `tail -f ${tailArg} ${RPC_OUT}`], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+
+		// After first connect, track lines for reconnect
+		if (linesProcessed < 0) linesProcessed = 0;
+
+		tailChild.stdout!.on("data", (data: Buffer) => {
+			lineBuf += data.toString();
+			const lines = lineBuf.split("\n");
+			lineBuf = lines.pop() || "";
+			for (const line of lines) {
+				linesProcessed++;
+				if (!line.trim()) continue;
+				try {
+					const event = JSON.parse(line);
+					if (eventHandler) eventHandler(event);
+				} catch { /* not JSON */ }
+			}
+		});
+
+		tailChild.on("close", () => {
+			if (killed) return;
+			lineBuf = "";
+			reconnectTimer = setTimeout(() => startTail(), 3000);
+		});
+	}
+
+	startTail();
+
+	function send(cmd: object) {
+		if (killed) return;
+		const json = JSON.stringify(cmd) + "\n";
+		const writeChild = spawn("ssh", [...sshArgs(keyPath, vmId), `cat > ${RPC_IN}`], {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		writeChild.stdin.write(json);
+		writeChild.stdin.end();
+		writeChild.on("error", (err) => {
+			console.error(`[vers-lt] send failed (${vmId.slice(0, 12)}): ${err.message}`);
+		});
+	}
+
+	function reconnectTail() {
+		if (tailChild) {
+			try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
+			tailChild = null;
+		}
+		if (reconnectTimer) clearTimeout(reconnectTimer);
+		startTail();
+	}
+
+	async function kill() {
+		killed = true;
+		if (reconnectTimer) clearTimeout(reconnectTimer);
+		if (tailChild) {
+			try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
+			tailChild = null;
+		}
+		try {
+			await sshExec(keyPath, vmId, `
+				tmux kill-session -t pi-rpc 2>/dev/null || true
+				tmux kill-session -t pi-keeper 2>/dev/null || true
+				rm -rf ${RPC_DIR}
+			`);
+		} catch { /* VM might already be gone */ }
+	}
+
+	return { send, onEvent: (h) => { eventHandler = h; }, reconnectTail, kill, vmId };
+}
+
+// =============================================================================
 // Extension
 // =============================================================================
 
 export default function versLieutenantExtension(pi: ExtensionAPI) {
 	const lieutenants = new Map<string, Lieutenant>();
 	const rpcHandles = new Map<string, RpcHandle>();
+
+	/** Persist state after any mutation */
+	async function persist() {
+		try { await saveState(lieutenants); } catch (err) {
+			console.error("[vers-lt] Failed to persist state:", err);
+		}
+	}
 
 	function updateWidget(ctx?: { ui: { setWidget: (key: string, lines: string[] | undefined) => void } }) {
 		if (!ctx) return;
@@ -273,6 +431,100 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 		}
 		ctx.ui.setWidget("vers-lt", lines);
 	}
+
+	// =========================================================================
+	// Reconnection — restore lieutenants from previous session
+	// =========================================================================
+
+	function installEventHandler(lt: Lieutenant) {
+		const handle = rpcHandles.get(lt.name);
+		if (!handle) return;
+		handle.onEvent((event) => {
+			if (event.type === "agent_start") {
+				lt.status = "working";
+				lt.lastOutput = "";
+				lt.lastActivityAt = new Date().toISOString();
+				persist();
+			} else if (event.type === "agent_end") {
+				lt.status = "idle";
+				lt.lastActivityAt = new Date().toISOString();
+				if (lt.lastOutput.trim()) {
+					lt.outputHistory.push(lt.lastOutput);
+					if (lt.outputHistory.length > 20) lt.outputHistory.shift();
+				}
+				persist();
+			} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+				lt.lastOutput += event.assistantMessageEvent.delta;
+			}
+		});
+	}
+
+	// Attempt reconnection at startup (async, non-blocking)
+	(async () => {
+		const saved = await loadState();
+		if (saved.length === 0) return;
+
+		console.error(`[vers-lt] Found ${saved.length} saved lieutenant(s), attempting reconnection...`);
+
+		for (const persisted of saved) {
+			try {
+				// Check VM status via Vers API
+				let vmState: string;
+				try {
+					const info = await versApi<{ state: string }>("GET", `/vm/${encodeURIComponent(persisted.vmId)}/status`);
+					vmState = info.state;
+				} catch (err) {
+					// VM no longer exists
+					console.error(`[vers-lt] ${persisted.name}: VM ${persisted.vmId.slice(0, 12)} not found, removing.`);
+					continue;
+				}
+
+				const lt: Lieutenant = {
+					name: persisted.name,
+					role: persisted.role,
+					vmId: persisted.vmId,
+					status: "idle",
+					lastOutput: "",
+					outputHistory: [],
+					taskCount: persisted.taskCount,
+					createdAt: persisted.createdAt,
+					lastActivityAt: persisted.lastActivityAt,
+				};
+
+				if (vmState === "Paused" || vmState === "paused") {
+					lt.status = "paused";
+					lieutenants.set(lt.name, lt);
+					console.error(`[vers-lt] ${lt.name}: reconnected (paused)`);
+					continue;
+				}
+
+				if (vmState !== "Running" && vmState !== "running") {
+					console.error(`[vers-lt] ${lt.name}: VM in unexpected state "${vmState}", skipping.`);
+					continue;
+				}
+
+				// VM is running — reconnect RPC (tail -f, command channel)
+				const handle = await reconnectRpcAgent(lt.vmId);
+				lieutenants.set(lt.name, lt);
+				rpcHandles.set(lt.name, handle);
+				installEventHandler(lt);
+				console.error(`[vers-lt] ${lt.name}: reconnected (running, VM ${lt.vmId.slice(0, 12)})`);
+			} catch (err) {
+				console.error(`[vers-lt] ${persisted.name}: reconnection failed —`, err instanceof Error ? err.message : err);
+			}
+		}
+
+		// Re-persist with only the successfully reconnected lieutenants
+		if (lieutenants.size > 0) {
+			await persist();
+			console.error(`[vers-lt] ${lieutenants.size} lieutenant(s) reconnected.`);
+		} else {
+			// Clean up state file if nothing reconnected
+			try { await writeFile(STATE_PATH, JSON.stringify({ lieutenants: [], savedAt: new Date().toISOString() })); } catch {}
+		}
+	})().catch(err => {
+		console.error("[vers-lt] Reconnection failed:", err);
+	});
 
 	// --- vers_lt_create ---
 	pi.registerTool({
@@ -382,25 +634,8 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lastActivityAt: new Date().toISOString(),
 			};
 
-			// Install event handler
-			handle.onEvent((event) => {
-				if (event.type === "agent_start") {
-					lt.status = "working";
-					lt.lastOutput = "";
-					lt.lastActivityAt = new Date().toISOString();
-				} else if (event.type === "agent_end") {
-					lt.status = "idle";
-					lt.lastActivityAt = new Date().toISOString();
-					// Archive the completed response
-					if (lt.lastOutput.trim()) {
-						lt.outputHistory.push(lt.lastOutput);
-						// Keep last 20 responses
-						if (lt.outputHistory.length > 20) lt.outputHistory.shift();
-					}
-				} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-					lt.lastOutput += event.assistantMessageEvent.delta;
-				}
-			});
+			// Install event handler (shared with reconnection path)
+			installEventHandler(lt);
 
 			// Set model if specified
 			if (model) {
@@ -409,6 +644,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 			lieutenants.set(name, lt);
 			rpcHandles.set(name, handle);
+			await persist();
 			if (ctx) updateWidget(ctx);
 
 			return {
@@ -479,6 +715,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			}
 
 			lt.lastActivityAt = new Date().toISOString();
+			await persist();
 			if (ctx) updateWidget(ctx);
 
 			return {
@@ -613,6 +850,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			await versApi("PATCH", `/vm/${encodeURIComponent(lt.vmId)}/state`, { state: "Paused" });
 			lt.status = "paused";
 			lt.lastActivityAt = new Date().toISOString();
+			await persist();
 
 			if (ctx) updateWidget(ctx);
 
@@ -658,6 +896,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 			if (!ready) {
 				lt.status = "error";
+				await persist();
 				if (ctx) updateWidget(ctx);
 				throw new Error(`Lieutenant "${name}" VM resumed but pi session not found. The tmux session may have been lost.`);
 			}
@@ -670,6 +909,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 			lt.status = "idle";
 			lt.lastActivityAt = new Date().toISOString();
+			await persist();
 
 			if (ctx) updateWidget(ctx);
 
@@ -732,6 +972,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				keyCache.delete(lt.vmId);
 			}
 
+			await persist();
 			if (ctx) updateWidget(ctx);
 
 			return {
@@ -742,13 +983,17 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 	// Cleanup on session shutdown
 	pi.on("session_shutdown", async () => {
-		// Don't auto-destroy lieutenants on shutdown — they're persistent.
-		// Just disconnect the tail SSH processes.
-		for (const handle of rpcHandles.values()) {
-			// We only kill the local tail, not the remote pi daemon.
-			// The VM and pi session survive the meta session closing.
-			// TODO: persist lieutenant state to disk so we can reconnect
-			// on next session start.
+		// Persist final state so next session can reconnect
+		await persist();
+
+		// Disconnect local SSH tails — but don't kill remote pi daemons.
+		// The VMs and pi sessions survive the meta session closing.
+		for (const [name, handle] of rpcHandles) {
+			try {
+				// Only kill the local tail process, not the remote tmux sessions
+				// We can't call handle.kill() because that kills the remote daemon too
+				// Instead, just let the process cleanup happen naturally
+			} catch { /* ignore */ }
 		}
 		rpcHandles.clear();
 	});
