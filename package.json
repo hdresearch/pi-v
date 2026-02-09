@@ -13,7 +13,8 @@
       "./extensions/background-process.ts",
       "./extensions/plan-mode/index.ts",
       "./extensions/vers-swarm.ts",
-      "./extensions/vers-vm.ts"
+      "./extensions/vers-vm.ts",
+      "./extensions/agent-services.ts"
     ],
     "skills": [
       "./skills"
