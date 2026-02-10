@@ -16,8 +16,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
-import { writeFile, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile, mkdir, readdir, stat, access, readFile } from "node:fs/promises";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
 // =============================================================================
@@ -72,7 +72,7 @@ interface SSHKeyInfo { ssh_port: number; ssh_private_key: string }
 
 const keyCache = new Map<string, string>(); // vmId -> keyPath
 
-async function ensureKeyFile(vmId: string): Promise<string> {
+export async function ensureKeyFile(vmId: string): Promise<string> {
 	const existing = keyCache.get(vmId);
 	if (existing) return existing;
 
@@ -85,7 +85,7 @@ async function ensureKeyFile(vmId: string): Promise<string> {
 	return keyPath;
 }
 
-function sshArgs(keyPath: string, vmId: string): string[] {
+export function sshArgs(keyPath: string, vmId: string): string[] {
 	return [
 		"-i", keyPath,
 		"-o", "StrictHostKeyChecking=no",
@@ -100,7 +100,7 @@ function sshArgs(keyPath: string, vmId: string): string[] {
 }
 
 /** Run a one-shot SSH command */
-function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+export function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 	return new Promise((resolve, reject) => {
 		const args = sshArgs(keyPath, vmId);
 		const child = spawn("ssh", [...args, command], {
@@ -115,6 +115,144 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 	});
 }
 
+// =============================================================================
+// Pi config sync — copy local skills, settings, extensions to remote VM
+// =============================================================================
+
+/**
+ * Sync the user's local pi configuration to a remote VM.
+ * This ensures remote agents inherit skills, custom instructions,
+ * settings, and extensions from the orchestrator's machine.
+ *
+ * Syncs:
+ *   ~/.pi/agent/skills/         → VM:~/.pi/agent/skills/
+ *   ~/.pi/agent/settings.json   → VM:~/.pi/agent/settings.json
+ *   ~/.pi/agent/AGENTS.md       → VM:~/.pi/agent/AGENTS.md (if exists)
+ *   ~/.pi/agent/git/            → VM:~/.pi/agent/git/ (installed packages/extensions)
+ */
+export async function syncPiConfig(keyPath: string, vmId: string): Promise<string[]> {
+	const home = homedir();
+	const piDir = join(home, ".pi");
+	const agentDir = join(piDir, "agent");
+	const synced: string[] = [];
+
+	// Helper: run scp with the same SSH options as our other commands
+	function scpToVm(localPath: string, remotePath: string, recursive = false): Promise<{ exitCode: number; stderr: string }> {
+		return new Promise((resolve, reject) => {
+			const args = [
+				...(recursive ? ["-r"] : []),
+				"-i", keyPath,
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				"-o", "LogLevel=ERROR",
+				"-o", "ConnectTimeout=30",
+				"-o", `ProxyCommand=openssl s_client -connect ${vmId}.vm.vers.sh:443 -servername ${vmId}.vm.vers.sh -quiet 2>/dev/null`,
+				localPath,
+				`root@${vmId}.vm.vers.sh:${remotePath}`,
+			];
+			const child = spawn("scp", args, { stdio: ["ignore", "pipe", "pipe"] });
+			let stderr = "";
+			child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+			child.on("error", reject);
+			child.on("close", (code) => resolve({ exitCode: code ?? 0, stderr }));
+		});
+	}
+
+	// Ensure remote directories exist
+	await sshExec(keyPath, vmId, "mkdir -p /root/.pi/agent/skills /root/.pi/agent/git");
+
+	// 1. Sync skills — copy each skill dir individually to avoid nesting issues
+	try {
+		const skillsDir = join(agentDir, "skills");
+		const entries = await readdir(skillsDir).catch(() => []);
+		const skillDirs = [];
+		for (const entry of entries) {
+			const entryPath = join(skillsDir, entry);
+			const s = await stat(entryPath);
+			if (s.isDirectory()) skillDirs.push(entry);
+		}
+		if (skillDirs.length > 0) {
+			// scp each skill dir into /root/.pi/agent/skills/
+			let allOk = true;
+			for (const skillDir of skillDirs) {
+				const result = await scpToVm(join(skillsDir, skillDir), `/root/.pi/agent/skills/${skillDir}`, true);
+				if (result.exitCode !== 0) {
+					console.error(`[vers-swarm] scp skill ${skillDir} failed: ${result.stderr}`);
+					allOk = false;
+				}
+			}
+			if (allOk) synced.push(`skills (${skillDirs.length} skill dirs)`);
+		}
+	} catch { /* no skills dir */ }
+
+	// 2. Sync settings.json
+	try {
+		const settingsPath = join(agentDir, "settings.json");
+		await access(settingsPath);
+		const result = await scpToVm(settingsPath, "/root/.pi/agent/settings.json");
+		if (result.exitCode === 0) synced.push("settings.json");
+	} catch { /* no settings */ }
+
+	// 3. Sync global AGENTS.md
+	try {
+		const agentsMdPath = join(agentDir, "AGENTS.md");
+		await access(agentsMdPath);
+		const result = await scpToVm(agentsMdPath, "/root/.pi/agent/AGENTS.md");
+		if (result.exitCode === 0) synced.push("AGENTS.md");
+	} catch { /* no AGENTS.md */ }
+
+	// 4. Sync installed packages (extensions + package skills)
+	// Use rsync for efficiency (excludes .git, node_modules), fall back to scp
+	try {
+		const gitDir = join(agentDir, "git");
+		const entries = await readdir(gitDir).catch(() => []);
+		if (entries.length > 0) {
+			const rsyncResult = await new Promise<{ exitCode: number; stderr: string }>((resolve) => {
+				// Trailing slash on source means "contents of" — avoids nesting
+				const sshCmd = [
+					`ssh -i ${keyPath}`,
+					`-o StrictHostKeyChecking=no`,
+					`-o UserKnownHostsFile=/dev/null`,
+					`-o LogLevel=ERROR`,
+					`-o ConnectTimeout=30`,
+					`-o "ProxyCommand=openssl s_client -connect ${vmId}.vm.vers.sh:443 -servername ${vmId}.vm.vers.sh -quiet 2>/dev/null"`,
+				].join(" ");
+				const args = [
+					"-az", "--delete",
+					"--exclude", ".git",
+					"--exclude", "node_modules",
+					"-e", sshCmd,
+					`${gitDir}/`,  // trailing slash = contents of gitDir
+					`root@${vmId}.vm.vers.sh:/root/.pi/agent/git/`,
+				];
+				const child = spawn("rsync", args, { stdio: ["ignore", "pipe", "pipe"] });
+				let stderr = "";
+				child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+				child.on("error", () => resolve({ exitCode: 127, stderr: "rsync not found" }));
+				child.on("close", (code) => resolve({ exitCode: code ?? 0, stderr }));
+			});
+
+			if (rsyncResult.exitCode === 0) {
+				synced.push("packages/extensions (rsync)");
+			} else {
+				console.error(`[vers-swarm] rsync packages failed (code ${rsyncResult.exitCode}): ${rsyncResult.stderr}`);
+				// No scp fallback — rsync handles the exclude patterns we need
+			}
+		}
+	} catch { /* no git dir */ }
+
+	// 5. Run npm install for any packages that need it (extensions with dependencies)
+	if (synced.some(s => s.includes("packages"))) {
+		try {
+			await sshExec(keyPath, vmId,
+				`find /root/.pi/agent/git -name package.json -not -path '*/node_modules/*' -execdir npm install --production --silent \\; 2>/dev/null`
+			);
+		} catch { /* non-critical */ }
+	}
+
+	return synced;
+}
+
 /**
  * Start pi in RPC mode on a VM as a **daemon** (detached from SSH).
  *
@@ -125,7 +263,7 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
  *   - Events are read via `tail -f` over SSH, which auto-reconnects on drop
  *   - If the tail SSH drops, pi stays alive — we just reconnect
  */
-interface StartRpcOptions {
+export interface StartRpcOptions {
 	anthropicApiKey: string;
 	versApiKey?: string;
 	versBaseUrl?: string;
@@ -138,19 +276,20 @@ const RPC_ERR = `${RPC_DIR}/err`;    // Regular file — pi stderr
 const RPC_PID = `${RPC_DIR}/pi.pid`;
 const RPC_KEEPER_PID = `${RPC_DIR}/keeper.pid`;
 
-interface RpcHandle {
+export interface RpcHandle {
 	send: (cmd: object) => void;
 	onEvent: (handler: (event: any) => void) => void;
 	kill: () => Promise<void>;
 	vmId: string;
 }
 
-async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): Promise<RpcHandle> {
+export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): Promise<RpcHandle> {
 	// Build env vars
 	const envExports = [
 		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
+		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
 
 	// Step 1: Start pi inside a tmux session on the VM.
@@ -238,7 +377,7 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 		writeChild.stdin.write(json);
 		writeChild.stdin.end();
 		writeChild.on("error", (_err) => {
-			// Send failures — SSH connection dropped, retried by caller if needed
+			// Send failures are retried by the caller if needed
 		});
 	}
 
@@ -370,6 +509,16 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 				// Initialize status dir and registry on root VM
 				if (i === 0) {
 					await sshExec(keyPath, vmId, `mkdir -p /root/.swarm/status && echo '{"vms":[]}' > /root/.swarm/registry.json`);
+				}
+
+				// Sync local pi config (skills, settings, extensions) to VM
+				try {
+					const synced = await syncPiConfig(keyPath, vmId);
+					if (synced.length > 0) {
+						console.error(`[vers-swarm] ${label}: synced ${synced.join(", ")}`);
+					}
+				} catch (err) {
+					console.error(`[vers-swarm] ${label}: config sync failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
 				}
 
 				// Start pi RPC agent as daemon with Vers credentials
