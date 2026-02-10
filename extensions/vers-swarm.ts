@@ -289,6 +289,7 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
+		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
 
 	// Step 1: Start pi inside a tmux session on the VM.
