@@ -634,6 +634,11 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lastActivityAt: new Date().toISOString(),
 			};
 
+			// Register handle BEFORE installing event handler — installEventHandler
+			// looks up the handle from rpcHandles, so it must be present first.
+			lieutenants.set(name, lt);
+			rpcHandles.set(name, handle);
+
 			// Install event handler (shared with reconnection path)
 			installEventHandler(lt);
 
@@ -641,9 +646,6 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			if (model) {
 				handle.send({ type: "set_model", provider: "anthropic", modelId: model });
 			}
-
-			lieutenants.set(name, lt);
-			rpcHandles.set(name, handle);
 			await persist();
 			if (ctx) updateWidget(ctx);
 
