@@ -171,7 +171,8 @@ async function registryList(): Promise<RegistryEntry[]> {
 			},
 		});
 		if (!res.ok) return [];
-		return (await res.json()) as RegistryEntry[];
+		const data = await res.json() as { vms?: RegistryEntry[] } | RegistryEntry[];
+		return Array.isArray(data) ? data : (data.vms || []);
 	} catch {
 		return [];
 	}
