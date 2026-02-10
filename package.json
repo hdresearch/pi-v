@@ -10,7 +10,8 @@
     "url": "git+ssh://git@github.com/hdresearch/pi-v.git"
   },
   "bin": {
-    "vers-mcp": "./dist/mcp/server.js"
+    "vers-mcp": "./dist/mcp/server.js",
+    "vers-mcp-setup": "./dist/mcp/setup.js"
   },
   "scripts": {
     "build": "tsc",

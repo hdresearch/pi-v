@@ -19,6 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { VersClient, shellEscape, type VmConfig } from "../core/vers-client.js";
 import { SwarmManager } from "../core/swarm.js";
+import { writeState, clearState } from "./state.js";
 
 // =============================================================================
 // State
@@ -154,6 +155,7 @@ server.tool(
 			return errorText(`Cannot reach VM ${vmId}: ${result.stderr}`);
 		}
 		activeVmId = vmId;
+		await writeState({ activeVmId: vmId, updatedAt: new Date().toISOString() });
 		return text(`Active VM set to ${vmId}. Use vers_bash/vers_read/vers_edit/vers_write to execute on it.`);
 	},
 );
@@ -165,6 +167,7 @@ server.tool(
 	async () => {
 		const prev = activeVmId;
 		activeVmId = undefined;
+		await clearState();
 		return text(prev ? `Cleared active VM (was ${prev}).` : "Already in local mode.");
 	},
 );
@@ -401,6 +404,13 @@ server.tool(
 // =============================================================================
 
 async function main() {
+	// Clean slate on startup
+	await clearState();
+
+	// Clean up on exit
+	process.on("SIGINT", async () => { await clearState(); process.exit(0); });
+	process.on("SIGTERM", async () => { await clearState(); process.exit(0); });
+
 	const transport = new StdioServerTransport();
 	await server.connect(transport);
 	console.error("Vers MCP server running on stdio");
