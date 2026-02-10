@@ -1,24 +1,13 @@
 /**
- * Vers VM Extension
+ * Vers VM Extension (pi adapter)
  *
- * Integrates pi with the Vers platform (vers.sh) for Firecracker VM orchestration.
- * When a VM is active, the built-in tools (read, bash, edit, write) are routed
- * through SSH to the VM. The LLM sets the active VM via vers_vm_use.
- *
- * Requirements:
- *   - VERS_API_KEY environment variable set (or pass --vers-api-key)
- *   - ssh binary available on PATH
+ * Thin wrapper around the core VersClient. When a VM is active, the built-in
+ * tools (read, bash, edit, write) are routed through SSH to the VM.
  *
  * Tools provided:
- *   vers_vms          - List all VMs
- *   vers_vm_create    - Create a new root VM
- *   vers_vm_delete    - Delete a VM
- *   vers_vm_branch    - Branch (clone) a VM
- *   vers_vm_commit    - Snapshot a VM to a commit
- *   vers_vm_restore   - Restore a VM from a commit
- *   vers_vm_state     - Pause or resume a VM
- *   vers_vm_use       - Set the active VM (routes read/bash/edit/write to it)
- *   vers_vm_local     - Switch back to local execution
+ *   vers_vms, vers_vm_create, vers_vm_delete, vers_vm_branch,
+ *   vers_vm_commit, vers_vm_restore, vers_vm_state,
+ *   vers_vm_use, vers_vm_local
  *
  * Overrides (when a VM is active):
  *   read, bash, edit, write — routed through SSH to the active VM
@@ -26,222 +15,11 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { execFile, spawn } from "node:child_process";
-import { writeFile, unlink, mkdir, readFile, access, writeFile as fsWriteFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve, isAbsolute } from "node:path";
+import { spawn } from "node:child_process";
+import { access, readFile, writeFile as fsWriteFile, mkdir } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { constants } from "node:fs";
-
-// =============================================================================
-// Inline Vers API Client
-// =============================================================================
-
-const DEFAULT_BASE_URL = "https://api.vers.sh/api/v1";
-
-interface VersClientOptions {
-	apiKey?: string;
-	baseURL?: string;
-}
-
-interface Vm {
-	vm_id: string;
-	owner_id: string;
-	state: "booting" | "running" | "paused";
-	created_at: string;
-}
-
-interface NewVmResponse { vm_id: string }
-interface VmDeleteResponse { vm_id: string }
-interface VmCommitResponse { commit_id: string }
-interface VmSSHKeyResponse { ssh_port: number; ssh_private_key: string }
-
-interface VmConfig {
-	vcpu_count?: number | null;
-	mem_size_mib?: number | null;
-	fs_size_mib?: number | null;
-}
-
-/** Try to read VERS_API_KEY from ~/.vers/keys.json */
-function loadVersKeyFromDisk(): string {
-	try {
-		const homedir = process.env.HOME || process.env.USERPROFILE || "";
-		const keysPath = join(homedir, ".vers", "keys.json");
-		const data = require("fs").readFileSync(keysPath, "utf-8");
-		const parsed = JSON.parse(data);
-		return parsed?.keys?.VERS_API_KEY || "";
-	} catch {
-		return "";
-	}
-}
-
-class VersClient {
-	private explicitApiKey: string | undefined;
-	private baseURL: string;
-	private sshKeyCache = new Map<string, VmSSHKeyResponse>();
-	private keyPathCache = new Map<string, string>();
-
-	constructor(opts: VersClientOptions = {}) {
-		this.explicitApiKey = opts.apiKey || undefined;
-		this.baseURL = (opts.baseURL || process.env.VERS_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
-	}
-
-	/** Resolve the API key fresh each time — picks up keys added after session start */
-	private resolveApiKey(): string {
-		return this.explicitApiKey || process.env.VERS_API_KEY || loadVersKeyFromDisk() || "";
-	}
-
-	private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-		const url = `${this.baseURL}${path}`;
-		const headers: Record<string, string> = { "Content-Type": "application/json" };
-		const apiKey = this.resolveApiKey();
-		if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-		const res = await fetch(url, {
-			method,
-			headers,
-			body: body !== undefined ? JSON.stringify(body) : undefined,
-		});
-
-		if (!res.ok) {
-			const text = await res.text().catch(() => "");
-			throw new Error(`Vers API ${method} ${path} failed (${res.status}): ${text}`);
-		}
-
-		const ct = res.headers.get("content-type") || "";
-		if (ct.includes("application/json")) return res.json() as Promise<T>;
-		return undefined as T;
-	}
-
-	async list(): Promise<Vm[]> { return this.request<Vm[]>("GET", "/vms"); }
-	async createRoot(vmConfig: VmConfig, waitBoot?: boolean): Promise<NewVmResponse> {
-		const q = waitBoot ? "?wait_boot=true" : "";
-		return this.request<NewVmResponse>("POST", `/vm/new_root${q}`, { vm_config: vmConfig });
-	}
-	async delete(vmId: string): Promise<VmDeleteResponse> {
-		return this.request<VmDeleteResponse>("DELETE", `/vm/${encodeURIComponent(vmId)}`);
-	}
-	async branch(vmId: string): Promise<NewVmResponse> {
-		return this.request<NewVmResponse>("POST", `/vm/${encodeURIComponent(vmId)}/branch`);
-	}
-	async commit(vmId: string, keepPaused?: boolean): Promise<VmCommitResponse> {
-		const q = keepPaused ? "?keep_paused=true" : "";
-		return this.request<VmCommitResponse>("POST", `/vm/${encodeURIComponent(vmId)}/commit${q}`);
-	}
-	async restoreFromCommit(commitId: string): Promise<NewVmResponse> {
-		return this.request<NewVmResponse>("POST", "/vm/from_commit", { commit_id: commitId });
-	}
-	async updateState(vmId: string, state: "Paused" | "Running"): Promise<void> {
-		await this.request<void>("PATCH", `/vm/${encodeURIComponent(vmId)}/state`, { state });
-	}
-	async getSSHKey(vmId: string): Promise<VmSSHKeyResponse> {
-		const cached = this.sshKeyCache.get(vmId);
-		if (cached) return cached;
-		const key = await this.request<VmSSHKeyResponse>("GET", `/vm/${encodeURIComponent(vmId)}/ssh_key`);
-		this.sshKeyCache.set(vmId, key);
-		return key;
-	}
-
-	/** Get or create a persistent key file for a VM */
-	async ensureKeyFile(vmId: string): Promise<string> {
-		const existing = this.keyPathCache.get(vmId);
-		if (existing) return existing;
-
-		const keyInfo = await this.getSSHKey(vmId);
-		const keyDir = join(tmpdir(), "vers-ssh-keys");
-		await mkdir(keyDir, { recursive: true });
-		const keyPath = join(keyDir, `vers-${vmId.slice(0, 12)}.pem`);
-		await writeFile(keyPath, keyInfo.ssh_private_key, { mode: 0o600 });
-		this.keyPathCache.set(vmId, keyPath);
-		return keyPath;
-	}
-
-	/** Base SSH args for a VM (SSH-over-TLS via openssl ProxyCommand) */
-	async sshArgs(vmId: string): Promise<string[]> {
-		const keyPath = await this.ensureKeyFile(vmId);
-		const hostname = `${vmId}.vm.vers.sh`;
-		return [
-			"-i", keyPath,
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-			"-o", "LogLevel=ERROR",
-			"-o", "ConnectTimeout=30",
-			"-o", `ProxyCommand=openssl s_client -connect %h:443 -servername %h -quiet 2>/dev/null`,
-			`root@${hostname}`,
-		];
-	}
-
-	/** Execute a command on a VM via SSH, return stdout/stderr/exitCode */
-	async exec(vmId: string, command: string, timeoutMs = 300000): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-		const args = await this.sshArgs(vmId);
-		return new Promise((resolve, reject) => {
-			execFile("ssh", [...args, command], { maxBuffer: 10 * 1024 * 1024, timeout: timeoutMs }, (err, stdout, stderr) => {
-				if (err && typeof (err as any).code === "string" && (err as any).code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-					// Real SSH failure (not just non-zero exit)
-					if (!(err as any).killed && (err as any).signal == null && stdout === "" && stderr === "") {
-						reject(new Error(`SSH failed: ${err.message}`));
-						return;
-					}
-				}
-				const exitCode = (err as any)?.status ?? (err ? 1 : 0);
-				resolve({ stdout: stdout?.toString() ?? "", stderr: stderr?.toString() ?? "", exitCode });
-			});
-		});
-	}
-
-	/** Execute a command with streaming output via spawn */
-	execStreaming(vmId: string, command: string, opts: {
-		onData: (data: Buffer) => void;
-		signal?: AbortSignal;
-		timeout?: number;
-	}): Promise<{ exitCode: number | null }> {
-		return new Promise(async (resolve, reject) => {
-			try {
-				const args = await this.sshArgs(vmId);
-				const child = spawn("ssh", [...args, command], {
-					stdio: ["ignore", "pipe", "pipe"],
-				});
-
-				let timedOut = false;
-				let timeoutHandle: NodeJS.Timeout | undefined;
-				if (opts.timeout && opts.timeout > 0) {
-					timeoutHandle = setTimeout(() => {
-						timedOut = true;
-						child.kill("SIGTERM");
-					}, opts.timeout * 1000);
-				}
-
-				if (child.stdout) child.stdout.on("data", opts.onData);
-				if (child.stderr) child.stderr.on("data", opts.onData);
-
-				const onAbort = () => child.kill("SIGTERM");
-				if (opts.signal) {
-					if (opts.signal.aborted) { onAbort(); }
-					else { opts.signal.addEventListener("abort", onAbort, { once: true }); }
-				}
-
-				child.on("error", (err) => {
-					if (timeoutHandle) clearTimeout(timeoutHandle);
-					if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
-					reject(err);
-				});
-
-				child.on("close", (code) => {
-					if (timeoutHandle) clearTimeout(timeoutHandle);
-					if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
-					if (opts.signal?.aborted) { reject(new Error("aborted")); return; }
-					if (timedOut) { reject(new Error(`timeout:${opts.timeout}`)); return; }
-					resolve({ exitCode: code });
-				});
-			} catch (err) {
-				reject(err);
-			}
-		});
-	}
-}
-
-// =============================================================================
-// Extension
-// =============================================================================
+import { VersClient, shellEscape, type VmConfig } from "../src/core/vers-client.js";
 
 export default function versVmExtension(pi: ExtensionAPI) {
 	pi.registerFlag("vers-api-key", {
@@ -273,6 +51,9 @@ export default function versVmExtension(pi: ExtensionAPI) {
 		}
 		return client;
 	}
+
+	/** Expose getClient for swarm extension */
+	(pi as any).__versGetClient = getClient;
 
 	function updateStatus(ctx: { ui: { setStatus: (key: string, text: string | undefined) => void } }) {
 		if (activeVmId) {
@@ -402,7 +183,6 @@ export default function versVmExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const { vmId } = params as { vmId: string };
-			// Verify VM exists and is reachable
 			const result = await getClient().exec(vmId, "echo ok");
 			if (result.stdout.trim() !== "ok") {
 				throw new Error(`Cannot reach VM ${vmId}: ${result.stderr}`);
@@ -449,21 +229,16 @@ export default function versVmExtension(pi: ExtensionAPI) {
 			const { command, timeout } = params as { command: string; timeout?: number };
 
 			if (!activeVmId) {
-				// Local: delegate to default bash via child_process
 				return localBash(command, timeout, signal, onUpdate);
 			}
 
-			// Remote: stream via SSH
-			// Use explicit timeout if provided, otherwise fall back to the configured default
 			const defaultTimeout = pi.getFlag("vers-ssh-timeout") as number;
 			const effectiveTimeout = timeout !== undefined ? timeout : (defaultTimeout > 0 ? defaultTimeout : undefined);
 
 			const chunks: Buffer[] = [];
-			let totalBytes = 0;
 
 			const handleData = (data: Buffer) => {
 				chunks.push(data);
-				totalBytes += data.length;
 				if (onUpdate) {
 					const text = Buffer.concat(chunks).toString("utf-8");
 					const truncated = text.length > 50000 ? text.slice(-50000) : text;
@@ -519,7 +294,6 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				return localRead(path, offset, limit);
 			}
 
-			// Build a command that handles offset/limit
 			let cmd: string;
 			if (offset && limit) {
 				cmd = `sed -n '${offset},${offset + limit - 1}p' ${shellEscape(path)}`;
@@ -531,7 +305,6 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				cmd = `cat ${shellEscape(path)}`;
 			}
 
-			// Get total line count for context
 			const wcResult = await getClient().exec(activeVmId, `wc -l < ${shellEscape(path)}`);
 			const totalLines = parseInt(wcResult.stdout.trim()) || 0;
 
@@ -543,13 +316,11 @@ export default function versVmExtension(pi: ExtensionAPI) {
 			let text = result.stdout;
 			const outputLines = text.split("\n").length;
 
-			// Truncate if too large (50KB)
 			if (text.length > 50000) {
 				text = text.slice(0, 50000);
 				text += `\n\n[Output truncated at 50KB. Use offset/limit for large files.]`;
 			}
 
-			// Add continuation hint
 			const startLine = offset || 1;
 			const endLine = startLine + outputLines - 1;
 			if (endLine < totalLines) {
@@ -577,30 +348,21 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				return localEdit(path, oldText, newText);
 			}
 
-			// Read the file from VM
 			const readResult = await getClient().exec(activeVmId, `cat ${shellEscape(path)}`);
 			if (readResult.exitCode !== 0) {
 				throw new Error(readResult.stderr || `File not found: ${path}`);
 			}
 
 			const content = readResult.stdout;
-
-			// Check for exact match
 			const index = content.indexOf(oldText);
 			if (index === -1) {
 				throw new Error(`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`);
 			}
-
-			// Check uniqueness
-			const secondIndex = content.indexOf(oldText, index + 1);
-			if (secondIndex !== -1) {
+			if (content.indexOf(oldText, index + 1) !== -1) {
 				throw new Error(`Found multiple occurrences of the text in ${path}. Please provide more context to make it unique.`);
 			}
 
-			// Apply replacement
 			const newContent = content.substring(0, index) + newText + content.substring(index + oldText.length);
-
-			// Write back via SSH (use heredoc to handle special chars)
 			const marker = `VERS_EOF_${Date.now()}`;
 			const writeCmd = `cat > ${shellEscape(path)} << '${marker}'\n${newContent}\n${marker}`;
 			const writeResult = await getClient().exec(activeVmId, writeCmd);
@@ -608,10 +370,7 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				throw new Error(writeResult.stderr || `Failed to write ${path}`);
 			}
 
-			return {
-				content: [{ type: "text", text: `Successfully replaced text in ${path}.` }],
-				details: {},
-			};
+			return { content: [{ type: "text", text: `Successfully replaced text in ${path}.` }], details: {} };
 		},
 	});
 
@@ -631,7 +390,6 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				return localWrite(path, content);
 			}
 
-			// Create parent dirs and write via heredoc
 			const dir = path.replace(/\/[^/]*$/, "");
 			if (dir && dir !== path) {
 				await getClient().exec(activeVmId, `mkdir -p ${shellEscape(dir)}`);
@@ -644,10 +402,7 @@ export default function versVmExtension(pi: ExtensionAPI) {
 				throw new Error(result.stderr || `Failed to write ${path}`);
 			}
 
-			return {
-				content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
-				details: undefined,
-			};
+			return { content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }], details: undefined };
 		},
 	});
 
@@ -749,11 +504,7 @@ export default function versVmExtension(pi: ExtensionAPI) {
 // Local tool fallbacks (when no VM is active)
 // =============================================================================
 
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
-}
-
-async function localBash(
+function localBash(
 	command: string,
 	timeout: number | undefined,
 	signal: AbortSignal | undefined,
