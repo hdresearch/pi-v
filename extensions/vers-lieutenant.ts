@@ -116,6 +116,50 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 }
 
 // =============================================================================
+// Registry helpers (optional — all calls are best-effort, silent on failure)
+// =============================================================================
+
+async function registryPost(entry: { id: string; name: string; role: string; address: string; registeredBy: string; metadata?: Record<string, unknown> }): Promise<void> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return;
+	try {
+		await fetch(`${infraUrl}/registry/vms`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "Authorization": `Bearer ${authToken}` },
+			body: JSON.stringify(entry),
+		});
+	} catch { /* best effort */ }
+}
+
+async function registryDelete(vmId: string): Promise<void> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return;
+	try {
+		await fetch(`${infraUrl}/registry/vms/${encodeURIComponent(vmId)}`, {
+			method: "DELETE",
+			headers: { "Authorization": `Bearer ${authToken}` },
+		});
+	} catch { /* best effort */ }
+}
+
+async function registryList(): Promise<any[]> {
+	const infraUrl = process.env.VERS_INFRA_URL;
+	const authToken = process.env.VERS_AUTH_TOKEN;
+	if (!infraUrl || !authToken) return [];
+	try {
+		const res = await fetch(`${infraUrl}/registry/vms`, {
+			method: "GET",
+			headers: { "Authorization": `Bearer ${authToken}` },
+		});
+		if (!res.ok) return [];
+		const data = await res.json() as any;
+		return Array.isArray(data) ? data : (data.vms || []);
+	} catch { return []; }
+}
+
+// =============================================================================
 // RPC agent daemon (same architecture as vers-swarm)
 // =============================================================================
 
@@ -142,6 +186,9 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		process.env.VERS_API_KEY ? `export VERS_API_KEY='${loadApiKey()}'` : "",
 		process.env.VERS_BASE_URL ? `export VERS_BASE_URL='${process.env.VERS_BASE_URL}'` : "",
+		process.env.VERS_INFRA_URL ? `export VERS_INFRA_URL='${process.env.VERS_INFRA_URL}'` : "",
+		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
+		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
 
 	// Build pi command with optional system prompt
@@ -647,6 +694,21 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			await persist();
 			if (ctx) updateWidget(ctx);
 
+			// Best-effort registry registration
+			await registryPost({
+				id: vmId,
+				name: name,
+				role: "lieutenant",
+				address: `${vmId}.vm.vers.sh`,
+				registeredBy: "vers-lieutenant",
+				metadata: {
+					agentId: name,
+					role: lt.role,
+					commitId,
+					createdAt: lt.createdAt,
+				},
+			});
+
 			return {
 				content: [{
 					type: "text",
@@ -946,6 +1008,9 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			for (const n of targets) {
 				const lt = lieutenants.get(n)!;
 
+				// Best-effort registry deregistration
+				await registryDelete(lt.vmId);
+
 				// Kill RPC
 				const handle = rpcHandles.get(n);
 				if (handle) {
@@ -979,6 +1044,124 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: results.join("\n") }],
 			};
 		},
+	});
+
+	// --- vers_lt_discover ---
+	pi.registerTool({
+		name: "vers_lt_discover",
+		label: "Discover Lieutenants",
+		description: "Discover running lieutenants from the registry and reconnect to them. Use after session restart to recover lieutenant state.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const results = await discoverFromRegistry();
+			if (ctx) updateWidget(ctx);
+			if (results.length === 0) {
+				return { content: [{ type: "text", text: "No lieutenants found in registry." }] };
+			}
+			return {
+				content: [{ type: "text", text: `Discovery results:\n${results.join("\n")}` }],
+				details: { discovered: results.length },
+			};
+		},
+	});
+
+	/**
+	 * Discover and reconnect lieutenants from the registry.
+	 * Returns an array of result strings describing what happened for each entry.
+	 * Safe to call when registry is unavailable — returns empty array.
+	 */
+	async function discoverFromRegistry(): Promise<string[]> {
+		const entries = await registryList();
+		const ltEntries = entries.filter((e: any) => e.registeredBy === "vers-lieutenant" && e.role === "lieutenant");
+
+		if (ltEntries.length === 0) return [];
+
+		const results: string[] = [];
+		for (const entry of ltEntries) {
+			const name = entry.metadata?.agentId || entry.name;
+
+			// Skip if already tracked locally
+			if (lieutenants.has(name)) {
+				results.push(`${name}: already connected`);
+				continue;
+			}
+
+			try {
+				// Check VM status first
+				let vmState: string;
+				try {
+					const info = await versApi<{ state: string }>("GET", `/vm/${encodeURIComponent(entry.id)}/status`);
+					vmState = info.state;
+				} catch {
+					results.push(`${name}: VM ${entry.id.slice(0, 12)} not found, skipping`);
+					continue;
+				}
+
+				const lt: Lieutenant = {
+					name,
+					role: entry.metadata?.role || "recovered lieutenant",
+					vmId: entry.id,
+					status: "idle",
+					lastOutput: "",
+					outputHistory: [],
+					taskCount: 0,
+					createdAt: entry.metadata?.createdAt || new Date().toISOString(),
+					lastActivityAt: new Date().toISOString(),
+				};
+
+				if (vmState === "Paused" || vmState === "paused") {
+					lt.status = "paused";
+					lieutenants.set(name, lt);
+					results.push(`${name}: reconnected (paused, VM ${entry.id.slice(0, 12)})`);
+					continue;
+				}
+
+				if (vmState !== "Running" && vmState !== "running") {
+					results.push(`${name}: VM ${entry.id.slice(0, 12)} in unexpected state "${vmState}", skipping`);
+					continue;
+				}
+
+				// VM is running — check tmux session and reconnect
+				const keyPath = await ensureKeyFile(entry.id);
+				const check = await sshExec(keyPath, entry.id, "tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead");
+
+				if (!check.stdout.includes("alive")) {
+					results.push(`${name}: VM ${entry.id.slice(0, 12)} — pi-rpc not running, skipping`);
+					continue;
+				}
+
+				// Reconnect RPC
+				const handle = await reconnectRpcAgent(entry.id);
+				lieutenants.set(name, lt);
+				rpcHandles.set(name, handle);
+				installEventHandler(lt);
+				results.push(`${name}: reconnected to VM ${entry.id.slice(0, 12)}`);
+			} catch (err) {
+				results.push(`${name}: reconnect failed — ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+
+		if (results.length > 0) {
+			await persist();
+		}
+
+		return results;
+	}
+
+	// Auto-discover from registry on session start
+	pi.on("session_start", async (_event, ctx) => {
+		if (ctx) updateWidget(ctx);
+
+		// Auto-discover lieutenants from registry (best-effort, silent)
+		if (process.env.VERS_INFRA_URL) {
+			try {
+				const results = await discoverFromRegistry();
+				if (results.length > 0) {
+					console.error(`[vers-lt] Registry discovery: ${results.join("; ")}`);
+					if (ctx) updateWidget(ctx);
+				}
+			} catch { /* silent */ }
+		}
 	});
 
 	// Cleanup on session shutdown
