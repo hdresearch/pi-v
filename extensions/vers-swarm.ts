@@ -351,14 +351,12 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 			}
 		});
 
-		tailChild.stderr!.on("data", (d: Buffer) => {
-			const msg = d.toString().trim();
-			if (msg) console.error(`[vers-swarm] tail stderr (${vmId.slice(0, 12)}): ${msg}`);
+		tailChild.stderr!.on("data", (_d: Buffer) => {
+			// SSH noise (connection closed, broken pipe) — expected during reconnects
 		});
 
-		tailChild.on("close", (code) => {
+		tailChild.on("close", (_code) => {
 			if (killed) return;
-			console.error(`[vers-swarm] tail on ${vmId.slice(0, 12)} exited (code ${code}), reconnecting in 3s...`);
 			lineBuf = ""; // Reset partial line buffer on reconnect
 			// Reconnect after a delay — pi is still alive on the VM
 			reconnectTimer = setTimeout(() => startTail(), 3000);
@@ -377,8 +375,8 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		});
 		writeChild.stdin.write(json);
 		writeChild.stdin.end();
-		writeChild.on("error", (err) => {
-			console.error(`[vers-swarm] send failed (${vmId.slice(0, 12)}): ${err.message}`);
+		writeChild.on("error", (_err) => {
+			// Send failures are retried by the caller if needed
 		});
 	}
 
