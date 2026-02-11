@@ -142,7 +142,9 @@ async function registryPost(entry: RegistryEntry): Promise<void> {
 			},
 			body: JSON.stringify(entry),
 		});
-	} catch { /* best effort */ }
+	} catch (err) {
+		console.warn(`[vers-swarm] registry post failed for ${entry.name}: ${err instanceof Error ? err.message : String(err)}`);
+	}
 }
 
 async function registryDelete(vmId: string): Promise<void> {
