@@ -1,12 +1,16 @@
 /**
  * Vers Lieutenant Extension
  *
- * Persistent, conversational agent sessions running on Vers VMs.
+ * Persistent, conversational agent sessions running on Vers VMs or locally.
  * Unlike swarm agents (fire-and-forget, task-bound), lieutenants are
  * long-lived, accumulate context, and support multi-turn interaction.
  *
+ * Supports two execution modes:
+ *   - Remote (default): lieutenant runs on a Vers VM via SSH + RPC
+ *   - Local: lieutenant runs as a local pi subprocess (no VM required)
+ *
  * Tools:
- *   vers_lt_create  - Spawn a lieutenant on a new VM with a name and role
+ *   vers_lt_create  - Spawn a lieutenant on a new VM or locally
  *   vers_lt_send    - Send a message (prompt, steer, or follow-up)
  *   vers_lt_read    - Read latest output from a lieutenant
  *   vers_lt_status  - Status overview of all lieutenants
@@ -17,11 +21,12 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { writeFile, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import * as readline from "node:readline";
 
 // =============================================================================
 // Types
@@ -30,7 +35,8 @@ import { homedir } from "node:os";
 interface Lieutenant {
 	name: string;
 	role: string;
-	vmId: string;
+	vmId: string;            // "local-{name}" for local lieutenants
+	isLocal: boolean;
 	status: "starting" | "idle" | "working" | "paused" | "error";
 	lastOutput: string;
 	outputHistory: string[];  // Rolling buffer of complete responses
@@ -297,6 +303,131 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 }
 
 // =============================================================================
+// Local RPC agent (no VM — spawns pi as a local child process)
+// =============================================================================
+
+interface LocalRpcOptions {
+	anthropicApiKey?: string;
+	systemPrompt?: string;
+	model?: string;
+	cwd?: string;
+}
+
+async function startLocalRpcAgent(name: string, opts: LocalRpcOptions): Promise<RpcHandle> {
+	// Create a dedicated workspace for this lieutenant
+	const ltDir = join(homedir(), ".pi", "lieutenants", name);
+	const workDir = opts.cwd || join(ltDir, "workspace");
+	const sessionDir = join(ltDir, "sessions");
+	await mkdir(workDir, { recursive: true });
+	await mkdir(sessionDir, { recursive: true });
+
+	// Write system prompt file if provided
+	if (opts.systemPrompt) {
+		await writeFile(join(ltDir, "system-prompt.md"), opts.systemPrompt);
+	}
+
+	// Build pi command args
+	const args = ["--mode", "rpc", "--session-dir", sessionDir];
+	if (opts.systemPrompt) {
+		args.push("--system-prompt", join(ltDir, "system-prompt.md"));
+	}
+	if (opts.model) {
+		args.push("--model", opts.model);
+	}
+
+	// Build environment — inherit parent env, overlay API key if provided
+	const env: Record<string, string> = { ...process.env as Record<string, string> };
+	if (opts.anthropicApiKey) {
+		env.ANTHROPIC_API_KEY = opts.anthropicApiKey;
+	}
+
+	// Spawn pi as a local child process
+	const child: ChildProcess = spawn("pi", args, {
+		cwd: workDir,
+		env,
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+
+	if (!child.stdin || !child.stdout || !child.stderr) {
+		throw new Error(`Failed to spawn pi process for lieutenant "${name}"`);
+	}
+
+	let eventHandler: ((event: any) => void) | undefined;
+	let killed = false;
+	let rl: readline.Interface | null = null;
+
+	// Set up line reader for stdout (JSON events)
+	rl = readline.createInterface({ input: child.stdout, terminal: false });
+	rl.on("line", (line: string) => {
+		if (!line.trim()) return;
+		try {
+			const event = JSON.parse(line);
+			if (eventHandler) eventHandler(event);
+		} catch { /* not JSON — ignore */ }
+	});
+
+	// Collect stderr for debugging
+	let stderrBuf = "";
+	child.stderr.on("data", (data: Buffer) => {
+		stderrBuf += data.toString();
+	});
+
+	// Handle process exit
+	child.on("exit", (code) => {
+		if (!killed) {
+			console.error(`[vers-lt] Local lieutenant "${name}" exited with code ${code}`);
+		}
+	});
+
+	// Wait for process to initialize
+	await new Promise<void>((resolve) => setTimeout(resolve, 500));
+	if (child.exitCode !== null) {
+		throw new Error(`Pi process for "${name}" exited immediately (code ${child.exitCode}). Stderr: ${stderrBuf}`);
+	}
+
+	function send(cmd: object) {
+		if (killed || !child.stdin || child.exitCode !== null) return;
+		const json = JSON.stringify(cmd) + "\n";
+		try {
+			child.stdin.write(json);
+		} catch (err) {
+			console.error(`[vers-lt] send failed for local lt "${name}": ${err instanceof Error ? err.message : err}`);
+		}
+	}
+
+	function reconnectTail() {
+		// No-op for local — stdout pipe is always connected
+	}
+
+	async function kill() {
+		killed = true;
+		if (rl) { rl.close(); rl = null; }
+		if (child.exitCode === null) {
+			child.kill("SIGTERM");
+			// Wait for graceful exit, then force kill
+			await new Promise<void>((resolve) => {
+				const timeout = setTimeout(() => {
+					try { child.kill("SIGKILL"); } catch { /* ignore */ }
+					resolve();
+				}, 3000);
+				child.on("exit", () => {
+					clearTimeout(timeout);
+					resolve();
+				});
+			});
+		}
+	}
+
+	return {
+		send,
+		onEvent: (h) => { eventHandler = h; },
+		reconnectTail,
+		kill,
+		vmId: `local-${name}`,
+	};
+}
+
+// =============================================================================
 // Persistence — save/load lieutenant state to ~/.pi/lieutenants.json
 // =============================================================================
 
@@ -304,6 +435,7 @@ interface PersistedLieutenant {
 	name: string;
 	role: string;
 	vmId: string;
+	isLocal: boolean;
 	status: string;
 	taskCount: number;
 	createdAt: string;
@@ -323,6 +455,7 @@ async function saveState(lieutenants: Map<string, Lieutenant>): Promise<void> {
 			name: lt.name,
 			role: lt.role,
 			vmId: lt.vmId,
+			isLocal: lt.isLocal,
 			status: lt.status,
 			taskCount: lt.taskCount,
 			createdAt: lt.createdAt,
@@ -474,7 +607,8 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lt.status === "paused" ? "⏸" :
 				lt.status === "error" ? "✗" : "○";
 			const tasks = lt.taskCount > 0 ? ` (${lt.taskCount} tasks)` : "";
-			lines.push(`${icon} ${name}: ${lt.status}${tasks} — ${lt.role.slice(0, 40)}`);
+			const loc = lt.isLocal ? " [local]" : "";
+			lines.push(`${icon} ${name}${loc}: ${lt.status}${tasks} — ${lt.role.slice(0, 40)}`);
 		}
 		ctx.ui.setWidget("vers-lt", lines);
 	}
@@ -515,6 +649,12 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 		for (const persisted of saved) {
 			try {
+				// Local LTs don't survive restarts — skip them
+				if (persisted.isLocal) {
+					console.error(`[vers-lt] ${persisted.name}: local lieutenant — cannot reconnect across sessions, removing.`);
+					continue;
+				}
+
 				// Check VM status via Vers API
 				let vmState: string;
 				try {
@@ -530,6 +670,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 					name: persisted.name,
 					role: persisted.role,
 					vmId: persisted.vmId,
+					isLocal: false,
 					status: "idle",
 					lastOutput: "",
 					outputHistory: [],
@@ -581,22 +722,124 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			"Spawn a persistent agent session on a new Vers VM.",
 			"The lieutenant stays alive across tasks, accumulates context,",
 			"and can be paused/resumed. Give it a name and role.",
+			"",
+			"Set local=true to run as a local process instead of on a VM.",
+			"Local mode requires no VM, no golden image — just spawns pi locally.",
+			"Trade-off: no isolation (shares filesystem), no pause/resume,",
+			"doesn't survive session restart. But works when VMs are unavailable.",
 		].join(" "),
 		parameters: Type.Object({
 			name: Type.String({ description: "Short name for this lieutenant (e.g., 'infra', 'billing')" }),
 			role: Type.String({ description: "Role description — becomes the lieutenant's system prompt context" }),
-			commitId: Type.String({ description: "Golden image commit ID to create VM from" }),
-			anthropicApiKey: Type.String({ description: "Anthropic API key for the lieutenant to use" }),
+			commitId: Type.Optional(Type.String({ description: "Golden image commit ID to create VM from (not needed for local mode)" })),
+			anthropicApiKey: Type.Optional(Type.String({ description: "Anthropic API key for the lieutenant to use (local mode inherits from environment)" })),
 			model: Type.Optional(Type.String({ description: "Model ID (default: claude-sonnet-4-20250514)" })),
+			local: Type.Optional(Type.Boolean({ description: "Run locally as a subprocess instead of on a Vers VM (default: false)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const { name, role, commitId, anthropicApiKey, model } = params as {
-				name: string; role: string; commitId: string;
-				anthropicApiKey: string; model?: string;
+			const { name, role, commitId, anthropicApiKey, model, local } = params as {
+				name: string; role: string; commitId?: string;
+				anthropicApiKey?: string; model?: string; local?: boolean;
 			};
 
 			if (lieutenants.has(name)) {
 				throw new Error(`Lieutenant '${name}' already exists. Destroy it first or use a different name.`);
+			}
+
+			// Build system prompt (shared between local and remote)
+			const systemPrompt = [
+				`You are a lieutenant agent named "${name}".`,
+				`Your role: ${role}`,
+				"",
+				"You are a persistent, long-lived agent session managed by a coordinator.",
+				"You accumulate context across multiple tasks. When given a new task,",
+				"you have full memory of previous work in this session.",
+				"",
+				"You have access to all pi tools including file operations, bash, and",
+				"any extensions installed on this machine.",
+				"",
+				"When you complete a task, end with a clear summary of what was done",
+				"and any open questions or next steps.",
+			].join("\n");
+
+			if (local) {
+				// ===== LOCAL MODE =====
+				const handle = await startLocalRpcAgent(name, {
+					anthropicApiKey,
+					systemPrompt,
+					model,
+				});
+
+				// Wait for RPC ready
+				const rpcReady = await new Promise<boolean>((resolve) => {
+					let resolved = false;
+					const timeout = setTimeout(() => { if (!resolved) { resolved = true; resolve(false); } }, 30000);
+					handle.onEvent((event) => {
+						if (!resolved && event.type === "response" && event.command === "get_state") {
+							resolved = true;
+							clearTimeout(timeout);
+							resolve(true);
+						}
+					});
+					let attempts = 0;
+					const trySend = () => {
+						if (resolved || attempts > 8) return;
+						attempts++;
+						handle.send({ id: "startup-check", type: "get_state" });
+						setTimeout(trySend, 2000);
+					};
+					setTimeout(trySend, 1000);
+				});
+
+				if (!rpcReady) {
+					await handle.kill();
+					throw new Error(`Local pi RPC failed to start for "${name}"`);
+				}
+
+				const lt: Lieutenant = {
+					name,
+					role,
+					vmId: `local-${name}`,
+					isLocal: true,
+					status: "idle",
+					lastOutput: "",
+					outputHistory: [],
+					taskCount: 0,
+					createdAt: new Date().toISOString(),
+					lastActivityAt: new Date().toISOString(),
+				};
+
+				lieutenants.set(name, lt);
+				rpcHandles.set(name, handle);
+				installEventHandler(lt);
+
+				if (model) {
+					handle.send({ type: "set_model", provider: "anthropic", modelId: model });
+				}
+				await persist();
+				if (ctx) updateWidget(ctx);
+
+				return {
+					content: [{
+						type: "text",
+						text: [
+							`Lieutenant "${name}" is ready (local mode).`,
+							`  Workspace: ~/.pi/lieutenants/${name}/workspace`,
+							`  Role: ${role}`,
+							`  Status: idle — waiting for first task`,
+							`  Note: local LTs share your filesystem and don't survive session restart.`,
+						].join("\n"),
+					}],
+					details: { name, vmId: `local-${name}`, role, local: true },
+				};
+			}
+
+			// ===== REMOTE MODE (existing behavior) =====
+			if (!commitId) {
+				throw new Error("commitId is required for remote lieutenants. Use local=true for local mode.");
+			}
+			if (!anthropicApiKey) {
+				throw new Error("anthropicApiKey is required for remote lieutenants. Use local=true to inherit from environment.");
 			}
 
 			// Create VM from golden commit
@@ -619,22 +862,6 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				try { await versApi("DELETE", `/vm/${vmId}`); } catch { /* ignore */ }
 				throw new Error(`VM ${vmId} failed to boot within 60s`);
 			}
-
-			// Build system prompt that gives the lieutenant its identity
-			const systemPrompt = [
-				`You are a lieutenant agent named "${name}".`,
-				`Your role: ${role}`,
-				"",
-				"You are a persistent, long-lived agent session managed by a coordinator.",
-				"You accumulate context across multiple tasks. When given a new task,",
-				"you have full memory of previous work in this session.",
-				"",
-				"You have access to all pi tools including Vers VM management and swarm",
-				"orchestration. You can spawn your own sub-swarms for parallel work.",
-				"",
-				"When you complete a task, end with a clear summary of what was done",
-				"and any open questions or next steps.",
-			].join("\n");
 
 			// Start pi RPC daemon
 			const handle = await startRpcAgent(keyPath, vmId, {
@@ -673,6 +900,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				name,
 				role,
 				vmId,
+				isLocal: false,
 				status: "idle",
 				lastOutput: "",
 				outputHistory: [],
@@ -858,10 +1086,11 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 					lt.status === "idle" ? "●" :
 					lt.status === "paused" ? "⏸" :
 					lt.status === "error" ? "✗" : "○";
+				const location = lt.isLocal ? "local" : `VM: ${lt.vmId.slice(0, 12)}`;
 				lines.push([
 					`${icon} ${name} [${lt.status}]`,
 					`  Role: ${lt.role}`,
-					`  VM: ${lt.vmId.slice(0, 12)}`,
+					`  ${location}`,
 					`  Tasks: ${lt.taskCount}`,
 					`  Last active: ${lt.lastActivityAt}`,
 					`  Output: ${lt.lastOutput.length} chars${lt.status === "working" ? " (streaming...)" : ""}`,
@@ -872,8 +1101,8 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: lines.join("\n\n") }],
 				details: {
 					lieutenants: Array.from(lieutenants.values()).map(lt => ({
-						name: lt.name, vmId: lt.vmId, status: lt.status,
-						taskCount: lt.taskCount, role: lt.role,
+						name: lt.name, vmId: lt.vmId, isLocal: lt.isLocal,
+						status: lt.status, taskCount: lt.taskCount, role: lt.role,
 					})),
 				},
 			};
@@ -897,6 +1126,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 			const lt = lieutenants.get(name);
 			if (!lt) throw new Error(`Lieutenant '${name}' not found.`);
+			if (lt.isLocal) throw new Error(`Lieutenant '${name}' is a local process — pause/resume requires a Vers VM.`);
 			if (lt.status === "paused") return { content: [{ type: "text", text: `${name} is already paused.` }] };
 
 			if (lt.status === "working") {
@@ -940,6 +1170,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 
 			const lt = lieutenants.get(name);
 			if (!lt) throw new Error(`Lieutenant '${name}' not found.`);
+			if (lt.isLocal) throw new Error(`Lieutenant '${name}' is a local process — pause/resume requires a Vers VM.`);
 			if (lt.status !== "paused") {
 				return { content: [{ type: "text", text: `${name} is not paused (status: ${lt.status}).` }] };
 			}
@@ -1010,33 +1241,39 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			for (const n of targets) {
 				const lt = lieutenants.get(n)!;
 
-				// Best-effort registry deregistration
-				await registryDelete(lt.vmId);
-
-				// Kill RPC
+				// Kill RPC handle
 				const handle = rpcHandles.get(n);
 				if (handle) {
 					try { await handle.kill(); } catch { /* ignore */ }
 					rpcHandles.delete(n);
 				}
 
-				// If paused, resume first so we can delete
-				if (lt.status === "paused") {
-					try {
-						await versApi("PATCH", `/vm/${encodeURIComponent(lt.vmId)}/state`, { state: "Running" });
-					} catch { /* ignore — delete might work anyway */ }
-				}
+				if (lt.isLocal) {
+					// Local lieutenant — just kill the process (already done above)
+					results.push(`${n}: destroyed (local, ${lt.taskCount} tasks completed)`);
+				} else {
+					// Remote lieutenant — deregister and delete VM
+					await registryDelete(lt.vmId);
 
-				// Delete VM
-				try {
-					await versApi("DELETE", `/vm/${encodeURIComponent(lt.vmId)}`);
-					results.push(`${n}: destroyed (VM ${lt.vmId.slice(0, 12)}, ${lt.taskCount} tasks completed)`);
-				} catch (err) {
-					results.push(`${n}: failed to delete VM — ${err instanceof Error ? err.message : String(err)}`);
+					// If paused, resume first so we can delete
+					if (lt.status === "paused") {
+						try {
+							await versApi("PATCH", `/vm/${encodeURIComponent(lt.vmId)}/state`, { state: "Running" });
+						} catch { /* ignore — delete might work anyway */ }
+					}
+
+					// Delete VM
+					try {
+						await versApi("DELETE", `/vm/${encodeURIComponent(lt.vmId)}`);
+						results.push(`${n}: destroyed (VM ${lt.vmId.slice(0, 12)}, ${lt.taskCount} tasks completed)`);
+					} catch (err) {
+						results.push(`${n}: failed to delete VM — ${err instanceof Error ? err.message : String(err)}`);
+					}
+
+					keyCache.delete(lt.vmId);
 				}
 
 				lieutenants.delete(n);
-				keyCache.delete(lt.vmId);
 			}
 
 			await persist();
@@ -1103,6 +1340,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 					name,
 					role: entry.metadata?.role || "recovered lieutenant",
 					vmId: entry.id,
+					isLocal: false,
 					status: "idle",
 					lastOutput: "",
 					outputHistory: [],
