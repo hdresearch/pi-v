@@ -41,13 +41,22 @@ info "Installing pi-v package from $REPO..."
 pi install "$REPO"
 
 # -----------------------------------------------------------
-# 4. Install extension dependencies (browser/puppeteer)
+# 4. Check for required environment variables
 # -----------------------------------------------------------
-PI_V_DIR="$HOME/.pi/agent/git/github.com/hdresearch/pi-v"
+MISSING=0
 
-if [ -d "$PI_V_DIR/extensions/browser" ]; then
-  info "Installing browser extension dependencies..."
-  (cd "$PI_V_DIR/extensions/browser" && npm install)
+if [ -z "${VERS_API_KEY:-}" ] && [ ! -f "$HOME/.vers/keys.json" ]; then
+  warn "VERS_API_KEY is not set and ~/.vers/keys.json not found."
+  warn "  Get your key from https://vers.sh and add to your shell config:"
+  warn "  export VERS_API_KEY=your-key-here"
+  MISSING=1
+fi
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  warn "ANTHROPIC_API_KEY is not set."
+  warn "  Required for spawning swarm agents. Add to your shell config:"
+  warn "  export ANTHROPIC_API_KEY=your-key-here"
+  MISSING=1
 fi
 
 # -----------------------------------------------------------
@@ -55,12 +64,24 @@ fi
 # -----------------------------------------------------------
 info "Done! Restart pi or run /reload to pick up the new extensions."
 printf "\n  Extensions:\n"
-printf "    • vers-vm        — Vers VM management\n"
-printf "    • vers-swarm     — Agent swarm orchestration\n"
-printf "    • browser        — Headless Chrome automation\n"
+printf "    • vers-vm           — Vers VM management\n"
+printf "    • vers-vm-copy      — File transfer between local and VMs\n"
+printf "    • vers-swarm        — Agent swarm orchestration\n"
 printf "    • background-process — Long-lived process management\n"
-printf "    • plan-mode      — Read-only exploration mode\n"
+printf "    • plan-mode         — Read-only exploration mode\n"
 printf "\n  Skills:\n"
-printf "    • vers-golden-vm\n"
+printf "    • bootstrap-fleet         — Full fleet setup from scratch\n"
+printf "    • vers-golden-vm          — Build golden VM images\n"
 printf "    • vers-platform-development\n"
-printf "    • investigate-vers-issue\n\n"
+printf "    • investigate-vers-issue\n"
+printf "    • contribute-fix\n"
+printf "    • vers-networking\n"
+
+if [ "$MISSING" -eq 1 ]; then
+  printf "\n"
+  warn "Some environment variables are missing (see warnings above)."
+  warn "Set them in your shell config, then restart pi."
+fi
+
+printf "\n  To bootstrap a full agent fleet, start pi and say:\n"
+printf "    \"bootstrap Vers agents\"\n\n"
