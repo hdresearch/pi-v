@@ -130,7 +130,7 @@ interface RegistryEntry {
 }
 
 async function registryPost(entry: RegistryEntry): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return;
 	try {
@@ -148,7 +148,7 @@ async function registryPost(entry: RegistryEntry): Promise<void> {
 }
 
 async function registryDelete(vmId: string): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return;
 	try {
@@ -162,7 +162,7 @@ async function registryDelete(vmId: string): Promise<void> {
 }
 
 async function registryList(): Promise<RegistryEntry[]> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return [];
 	try {
@@ -354,7 +354,7 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
-		process.env.VERS_INFRA_URL ? `export VERS_INFRA_URL='${process.env.VERS_INFRA_URL}'` : "",
+		process.env.VERS_VM_REGISTRY_URL ? `export VERS_VM_REGISTRY_URL='${process.env.VERS_VM_REGISTRY_URL}'` : "",
 		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
 		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
@@ -1068,11 +1068,11 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 		description: "Discover running swarm agents from the registry and reconnect to them. Use after session restart to recover swarm state.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const infraUrl = process.env.VERS_INFRA_URL;
+			const infraUrl = process.env.VERS_VM_REGISTRY_URL;
 			const authToken = process.env.VERS_AUTH_TOKEN;
 			if (!infraUrl || !authToken) {
 				return {
-					content: [{ type: "text", text: "Cannot discover agents: VERS_INFRA_URL and VERS_AUTH_TOKEN environment variables are required." }],
+					content: [{ type: "text", text: "Cannot discover agents: VERS_VM_REGISTRY_URL and VERS_AUTH_TOKEN environment variables are required." }],
 					details: {},
 				};
 			}
@@ -1088,7 +1088,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 	// Auto-discover on session start
 	pi.on("session_start", async (_event, ctx) => {
-		const infraUrl = process.env.VERS_INFRA_URL;
+		const infraUrl = process.env.VERS_VM_REGISTRY_URL;
 		const authToken = process.env.VERS_AUTH_TOKEN;
 		if (infraUrl && authToken) {
 			try {
