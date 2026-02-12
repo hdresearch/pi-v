@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="git@github.com:hdresearch/pi-v.git"
+REPO="https://github.com/hdresearch/pi-v"
 PI_PKG="@mariozechner/pi-coding-agent"
 VERS_API="https://vers.sh"
 
