@@ -122,33 +122,8 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 }
 
 // =============================================================================
-// Registry helpers (optional — all calls are best-effort, silent on failure)
+// Registry helpers (read-only — writes moved to agent-services via pi.events)
 // =============================================================================
-
-async function registryPost(entry: { id: string; name: string; role: string; address: string; registeredBy: string; metadata?: Record<string, unknown> }): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
-	const authToken = process.env.VERS_AUTH_TOKEN;
-	if (!infraUrl || !authToken) return;
-	try {
-		await fetch(`${infraUrl}/registry/vms`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json", "Authorization": `Bearer ${authToken}` },
-			body: JSON.stringify(entry),
-		});
-	} catch { /* best effort */ }
-}
-
-async function registryDelete(vmId: string): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
-	const authToken = process.env.VERS_AUTH_TOKEN;
-	if (!infraUrl || !authToken) return;
-	try {
-		await fetch(`${infraUrl}/registry/vms/${encodeURIComponent(vmId)}`, {
-			method: "DELETE",
-			headers: { "Authorization": `Bearer ${authToken}` },
-		});
-	} catch { /* best effort */ }
-}
 
 async function registryList(): Promise<any[]> {
 	const infraUrl = process.env.VERS_INFRA_URL;
@@ -934,19 +909,15 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			await persist();
 			if (ctx) updateWidget(ctx);
 
-			// Best-effort registry registration
-			await registryPost({
-				id: vmId,
-				name: name,
+			// Emit lifecycle event — agent-services extension handles registry
+			pi.events.emit("vers:lt_created", {
+				vmId,
+				name,
 				role: "lieutenant",
 				address: `${vmId}.vm.vers.sh`,
-				registeredBy: "vers-lieutenant",
-				metadata: {
-					agentId: name,
-					role: lt.role,
-					commitId,
-					createdAt: lt.createdAt,
-				},
+				ltRole: lt.role,
+				commitId,
+				createdAt: lt.createdAt,
 			});
 
 			return {
@@ -1262,8 +1233,8 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 					// Local lieutenant — just kill the process (already done above)
 					results.push(`${n}: destroyed (local, ${lt.taskCount} tasks completed)`);
 				} else {
-					// Remote lieutenant — deregister and delete VM
-					await registryDelete(lt.vmId);
+					// Remote lieutenant — emit lifecycle event, then delete VM
+					pi.events.emit("vers:lt_destroyed", { vmId: lt.vmId, name: n });
 
 					// If paused, resume first so we can delete
 					if (lt.status === "paused") {
