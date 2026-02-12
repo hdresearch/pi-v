@@ -12,25 +12,49 @@ ok()    { printf "\033[1;32m==>\033[0m %s\n" "$*"; }
 
 # Detect shell config file
 detect_shell_rc() {
-  if [ -f "$HOME/.zshrc" ]; then
-    echo "$HOME/.zshrc"
-  elif [ -f "$HOME/.bashrc" ]; then
-    echo "$HOME/.bashrc"
-  else
-    echo "$HOME/.bashrc"
-  fi
+  # Detect the user's actual shell, not the shell running this script
+  local user_shell="${SHELL:-/bin/bash}"
+  case "$user_shell" in
+    */fish)
+      echo "$HOME/.config/fish/config.fish"
+      ;;
+    */zsh)
+      echo "$HOME/.zshrc"
+      ;;
+    *)
+      echo "$HOME/.bashrc"
+      ;;
+  esac
 }
 
-# Append an export to shell config (idempotent)
+# Append an export to shell config (idempotent, shell-aware)
 persist_env() {
   local var_name="$1" var_value="$2" shell_rc="$3"
-  if ! grep -q "^export ${var_name}=" "$shell_rc" 2>/dev/null; then
-    echo "export ${var_name}=${var_value}" >> "$shell_rc"
-  else
-    # Update existing value
-    sed -i.bak "s|^export ${var_name}=.*|export ${var_name}=${var_value}|" "$shell_rc"
-    rm -f "${shell_rc}.bak"
-  fi
+
+  # Ensure parent directory exists (for fish)
+  mkdir -p "$(dirname "$shell_rc")"
+
+  case "$shell_rc" in
+    *.fish)
+      # Fish syntax: set -gx VAR value
+      if ! grep -q "set -gx ${var_name} " "$shell_rc" 2>/dev/null; then
+        echo "set -gx ${var_name} ${var_value}" >> "$shell_rc"
+      else
+        sed -i.bak "s|^set -gx ${var_name} .*|set -gx ${var_name} ${var_value}|" "$shell_rc"
+        rm -f "${shell_rc}.bak"
+      fi
+      ;;
+    *)
+      # Bash/zsh syntax: export VAR=value
+      if ! grep -q "^export ${var_name}=" "$shell_rc" 2>/dev/null; then
+        echo "export ${var_name}=${var_value}" >> "$shell_rc"
+      else
+        sed -i.bak "s|^export ${var_name}=.*|export ${var_name}=${var_value}|" "$shell_rc"
+        rm -f "${shell_rc}.bak"
+      fi
+      ;;
+  esac
+
   export "${var_name}=${var_value}"
 }
 
