@@ -120,7 +120,7 @@ function sshExec(keyPath: string, vmId: string, command: string): Promise<{ stdo
 // =============================================================================
 
 async function registryPost(entry: { id: string; name: string; role: string; address: string; registeredBy: string; metadata?: Record<string, unknown> }): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL || process.env.VERS_INFRA_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return;
 	try {
@@ -133,7 +133,7 @@ async function registryPost(entry: { id: string; name: string; role: string; add
 }
 
 async function registryDelete(vmId: string): Promise<void> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL || process.env.VERS_INFRA_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return;
 	try {
@@ -145,7 +145,7 @@ async function registryDelete(vmId: string): Promise<void> {
 }
 
 async function registryList(): Promise<any[]> {
-	const infraUrl = process.env.VERS_INFRA_URL;
+	const infraUrl = process.env.VERS_VM_REGISTRY_URL || process.env.VERS_INFRA_URL;
 	const authToken = process.env.VERS_AUTH_TOKEN;
 	if (!infraUrl || !authToken) return [];
 	try {
@@ -1170,6 +1170,14 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		// Persist final state so next session can reconnect
 		await persist();
+
+		// Best-effort deregister all known LTs from the registry.
+		// VMs and pi sessions survive — but registry entries should be cleaned up
+		// so stale entries don't accumulate. If this fails, heartbeat TTL handles it.
+		const deregPromises = Array.from(lieutenants.values()).map((lt) =>
+			registryDelete(lt.vmId).catch(() => { /* silent — TTL handles cleanup */ }),
+		);
+		await Promise.allSettled(deregPromises);
 
 		// Disconnect local SSH tails — but don't kill remote pi daemons.
 		// The VMs and pi sessions survive the meta session closing.
