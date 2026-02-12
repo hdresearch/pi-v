@@ -194,6 +194,7 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 		process.env.VERS_BASE_URL ? `export VERS_BASE_URL='${process.env.VERS_BASE_URL}'` : "",
 		process.env.VERS_INFRA_URL ? `export VERS_INFRA_URL='${process.env.VERS_INFRA_URL}'` : "",
 		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
+		`export VERS_PARENT_AGENT='${process.env.VERS_AGENT_NAME || "orchestrator"}'`,
 		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
 
@@ -340,6 +341,7 @@ async function startLocalRpcAgent(name: string, opts: LocalRpcOptions): Promise<
 	if (opts.anthropicApiKey) {
 		env.ANTHROPIC_API_KEY = opts.anthropicApiKey;
 	}
+	env.VERS_PARENT_AGENT = process.env.VERS_AGENT_NAME || "orchestrator";
 
 	// Spawn pi as a local child process
 	const child: ChildProcess = spawn("pi", args, {
