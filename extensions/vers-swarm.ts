@@ -40,13 +40,26 @@ interface SwarmAgent {
 // =============================================================================
 
 function loadApiKey(): string {
+	const homedir = process.env.HOME || process.env.USERPROFILE || "";
+
+	// Try env var first
+	if (process.env.VERS_API_KEY) return process.env.VERS_API_KEY;
+
+	// Try ~/.vers/keys.json (format: { keys: { VERS_API_KEY: "..." } })
 	try {
-		const homedir = process.env.HOME || process.env.USERPROFILE || "";
 		const data = require("fs").readFileSync(join(homedir, ".vers", "keys.json"), "utf-8");
-		return JSON.parse(data)?.keys?.VERS_API_KEY || "";
-	} catch {
-		return process.env.VERS_API_KEY || "";
-	}
+		const key = JSON.parse(data)?.keys?.VERS_API_KEY || "";
+		if (key) return key;
+	} catch {}
+
+	// Fall back to ~/.vers/config.json (format: { api_key: "..." } or { versApiKey: "..." })
+	try {
+		const data = require("fs").readFileSync(join(homedir, ".vers", "config.json"), "utf-8");
+		const parsed = JSON.parse(data);
+		return parsed?.versApiKey || parsed?.api_key || "";
+	} catch {}
+
+	return "";
 }
 
 const BASE_URL = process.env.VERS_BASE_URL || "https://api.vers.sh/api/v1";

@@ -195,8 +195,19 @@ else
   # Persist the key
   persist_env "VERS_API_KEY" "$API_KEY" "$SHELL_RC"
 
-  # Also write to ~/.vers/config.json for the vers CLI
+  # Write to ~/.vers/ in all formats tools might read
   mkdir -p "$HOME/.vers"
+
+  # ~/.vers/keys.json — the format pi-v extensions read (loadVersKeyFromDisk)
+  cat > "$HOME/.vers/keys.json" << KEYSEOF
+{
+  "keys": {
+    "VERS_API_KEY": "${API_KEY}"
+  }
+}
+KEYSEOF
+
+  # ~/.vers/config.json — the format vers CLI reads
   if [ -f "$HOME/.vers/config.json" ]; then
     node -e "
       const fs = require('fs');
@@ -209,7 +220,7 @@ else
     echo "{\"api_key\": \"${API_KEY}\", \"versApiKey\": \"${API_KEY}\"}" > "$HOME/.vers/config.json"
   fi
 
-  ok "VERS_API_KEY saved to ${SHELL_RC} and ~/.vers/config.json"
+  ok "VERS_API_KEY saved to ${SHELL_RC}, ~/.vers/keys.json, and ~/.vers/config.json"
 fi
 
 # -----------------------------------------------------------

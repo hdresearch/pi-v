@@ -61,17 +61,28 @@ interface VmConfig {
 	fs_size_mib?: number | null;
 }
 
-/** Try to read VERS_API_KEY from ~/.vers/keys.json */
+/** Try to read VERS_API_KEY from ~/.vers/keys.json or ~/.vers/config.json */
 function loadVersKeyFromDisk(): string {
+	const homedir = process.env.HOME || process.env.USERPROFILE || "";
+
+	// Try ~/.vers/keys.json first (format: { keys: { VERS_API_KEY: "..." } })
 	try {
-		const homedir = process.env.HOME || process.env.USERPROFILE || "";
 		const keysPath = join(homedir, ".vers", "keys.json");
 		const data = require("fs").readFileSync(keysPath, "utf-8");
 		const parsed = JSON.parse(data);
-		return parsed?.keys?.VERS_API_KEY || "";
-	} catch {
-		return "";
-	}
+		const key = parsed?.keys?.VERS_API_KEY || "";
+		if (key) return key;
+	} catch {}
+
+	// Fall back to ~/.vers/config.json (format: { api_key: "..." } or { versApiKey: "..." })
+	try {
+		const configPath = join(homedir, ".vers", "config.json");
+		const data = require("fs").readFileSync(configPath, "utf-8");
+		const parsed = JSON.parse(data);
+		return parsed?.versApiKey || parsed?.api_key || "";
+	} catch {}
+
+	return "";
 }
 
 class VersClient {
