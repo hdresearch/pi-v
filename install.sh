@@ -120,7 +120,7 @@ else
   else
     # New user — collect email and register
     printf "  Enter your email: "
-    read -r EMAIL || EMAIL=""
+    read -r EMAIL < /dev/tty || EMAIL=""
     if [ -z "$EMAIL" ]; then
       error "Email is required to create a Vers account."
     fi
@@ -222,7 +222,7 @@ else
   warn "ANTHROPIC_API_KEY is not set."
   printf "  Required for spawning swarm agents.\n"
   printf "  Enter your Anthropic API key (or press Enter to skip): "
-  read -r ANTHROPIC_KEY || ANTHROPIC_KEY=""
+  read -r ANTHROPIC_KEY < /dev/tty || ANTHROPIC_KEY=""
   if [ -n "$ANTHROPIC_KEY" ]; then
     persist_env "ANTHROPIC_API_KEY" "$ANTHROPIC_KEY" "$SHELL_RC"
     ok "ANTHROPIC_API_KEY saved to ${SHELL_RC}"
