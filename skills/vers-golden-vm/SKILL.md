@@ -64,7 +64,20 @@ EOF
 
 The swarm extension overwrites this with real values when spawning agents.
 
-### 7. Commit the golden image
+### 7. Bake infra env vars into the image
+
+If you have an infra VM running agent-services, bake the connection details into `/etc/environment` so all processes (including pi) inherit them — `.bashrc` only works for interactive shells:
+
+```bash
+cat >> /etc/environment << EOF
+VERS_INFRA_URL=https://<infra_vm_id>.vm.vers.sh:3000
+VERS_AUTH_TOKEN=<auth_token>
+EOF
+```
+
+Replace with actual values. This ensures spawned agents can use board/feed/log/registry tools immediately.
+
+### 8. Commit the golden image
 
 Switch back to local (`vers_vm_local`) and commit:
 
