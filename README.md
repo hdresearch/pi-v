@@ -238,7 +238,7 @@ npm install
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `VERS_API_KEY` | Yes | Vers API authentication key. Also reads from `~/.vers/keys.json` as fallback. |
+| `VERS_API_KEY` | Yes | Vers API authentication key. Get yours from `https://vers.sh/orgs/<org>/settings/api-keys`. Also reads from `~/.vers/keys.json` as fallback. |
 | `VERS_BASE_URL` | No | Override the Vers API base URL (default: `https://api.vers.sh/api/v1`) |
 
 These can also be set via CLI flags: `--vers-api-key`, `--vers-base-url`, `--vers-ssh-timeout`.

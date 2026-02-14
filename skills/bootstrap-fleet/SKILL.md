@@ -12,7 +12,7 @@ Guide a user from zero infrastructure to a working self-improving agent fleet on
 Before starting, verify these are in place:
 
 - [ ] `ANTHROPIC_API_KEY` is set
-- [ ] `VERS_API_KEY` is set
+- [ ] `VERS_API_KEY` is set (get yours from `https://vers.sh/orgs/<org>/settings/api-keys`)
 - [ ] pi-v package is installed (`pi install https://github.com/hdresearch/pi-v`)
 - [ ] vers-agent-services package is installed (`pi install https://github.com/hdresearch/vers-agent-services`)
 - [ ] Or run `curl -fsSL https://raw.githubusercontent.com/hdresearch/pi-v/main/install.sh | bash` to install both at once
