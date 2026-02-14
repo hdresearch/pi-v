@@ -699,17 +699,6 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 				agents.set(label, agent);
 				rpcHandles.set(label, handle);
-
-				// Register agent in coordination registry (best effort)
-				await registryPost({
-					id: vmId,
-					name: label,
-					role: "worker",
-					address: `${vmId}.vm.vers.sh`,
-					registeredBy: "vers-swarm",
-					metadata: { agentId: label, commitId, parentSession: true },
-				});
-
 				results.push(`${label}: VM ${vmId} — ready`);
 
 				// Emit lifecycle event — agent-services extension handles registry
@@ -919,8 +908,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					rpcHandles.delete(id);
 				}
 
-				// Deregister from coordination registry (best effort)
-				await registryDelete(agent.vmId);
+
 
 				// Emit lifecycle event before deleting VM
 				pi.events.emit("vers:agent_destroyed", { vmId: agent.vmId, label: id });
