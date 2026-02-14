@@ -4,8 +4,6 @@
  * Orchestrate a swarm of pi coding agents running on Vers VMs.
  * Each agent runs pi in RPC mode inside a branched VM.
  *
- * Supports multiple LLM providers: Anthropic, OpenAI, Google, Zai, and Azure.
- *
  * Tools:
  *   vers_swarm_spawn    - Branch N VMs from a commit and start pi agents
  *   vers_swarm_task     - Send a task to a specific agent
@@ -27,14 +25,6 @@ import { join } from "node:path";
 // Types
 // =============================================================================
 
-const PROVIDER_ENV_MAP: Record<string, string> = {
-	anthropic: "ANTHROPIC_API_KEY",
-	openai: "OPENAI_API_KEY",
-	google: "GOOGLE_API_KEY",
-	zai: "ZAI_API_KEY",
-	azure: "AZURE_OPENAI_API_KEY",
-};
-
 interface SwarmAgent {
 	id: string;
 	vmId: string;
@@ -43,6 +33,8 @@ interface SwarmAgent {
 	task?: string;
 	lastOutput: string;
 	events: string[];
+	lastActivityAt: number;        // timestamp of last RPC event received
+	completionWatchdog?: ReturnType<typeof setInterval>; // watchdog for stuck agents
 }
 
 // =============================================================================
@@ -115,7 +107,7 @@ export function sshArgs(keyPath: string, vmId: string): string[] {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
-		"-o", "ConnectTimeout=10",
+		"-o", "ConnectTimeout=30",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
 		"-o", `ProxyCommand=openssl s_client -connect %h:443 -servername %h -quiet 2>/dev/null`,
@@ -233,7 +225,7 @@ export async function syncPiConfig(keyPath: string, vmId: string): Promise<strin
 				"-o", "StrictHostKeyChecking=no",
 				"-o", "UserKnownHostsFile=/dev/null",
 				"-o", "LogLevel=ERROR",
-				"-o", "ConnectTimeout=10",
+				"-o", "ConnectTimeout=30",
 				"-o", `ProxyCommand=openssl s_client -connect ${vmId}.vm.vers.sh:443 -servername ${vmId}.vm.vers.sh -quiet 2>/dev/null`,
 				localPath,
 				`root@${vmId}.vm.vers.sh:${remotePath}`,
@@ -302,7 +294,7 @@ export async function syncPiConfig(keyPath: string, vmId: string): Promise<strin
 					`-o StrictHostKeyChecking=no`,
 					`-o UserKnownHostsFile=/dev/null`,
 					`-o LogLevel=ERROR`,
-					`-o ConnectTimeout=10`,
+					`-o ConnectTimeout=30`,
 					`-o "ProxyCommand=openssl s_client -connect ${vmId}.vm.vers.sh:443 -servername ${vmId}.vm.vers.sh -quiet 2>/dev/null"`,
 				].join(" ");
 				const args = [
@@ -352,9 +344,7 @@ export async function syncPiConfig(keyPath: string, vmId: string): Promise<strin
  *   - If the tail SSH drops, pi stays alive — we just reconnect
  */
 export interface StartRpcOptions {
-	provider: string;
-	apiKey: string;
-	model?: string;
+	anthropicApiKey: string;
 	versApiKey?: string;
 	versBaseUrl?: string;
 }
@@ -374,22 +364,15 @@ export interface RpcHandle {
 }
 
 export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): Promise<RpcHandle> {
-	// Build env vars using provider mapping
-	const envVar = PROVIDER_ENV_MAP[opts.provider] || `${opts.provider.toUpperCase()}_API_KEY`;
+	// Build env vars
 	const envExports = [
-		`export ${envVar}='${opts.apiKey}'`,
+		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
 		process.env.VERS_VM_REGISTRY_URL ? `export VERS_VM_REGISTRY_URL='${process.env.VERS_VM_REGISTRY_URL}'` : "",
 		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
-		`export VERS_PARENT_AGENT='${process.env.VERS_AGENT_NAME || "orchestrator"}'`,
 		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
-
-	// Build pi command with provider and optional model flags
-	const providerFlag = `--provider ${opts.provider}`;
-	const modelFlag = opts.model ? `--model ${opts.model}` : "";
-	const piCommand = `${envExports}; cd /root/workspace; pi --mode rpc --no-session ${providerFlag} ${modelFlag} < ${RPC_IN} >> ${RPC_OUT} 2>> ${RPC_ERR}`;
 
 	// Step 1: Start pi inside a tmux session on the VM.
 	// tmux survives SSH disconnects — if our tail -f drops, pi keeps running.
@@ -404,7 +387,7 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		tmux new-session -d -s pi-keeper "sleep infinity > ${RPC_IN}"
 
 		# Start pi in a tmux session, reading from FIFO, writing to file
-		tmux new-session -d -s pi-rpc "${piCommand}"
+		tmux new-session -d -s pi-rpc "${envExports}; cd /root/workspace; pi --mode rpc --no-session < ${RPC_IN} >> ${RPC_OUT} 2>> ${RPC_ERR}"
 
 		# Wait a moment for processes to start
 		sleep 1
@@ -426,41 +409,85 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let linesProcessed = 0; // Track lines so we skip on reconnect
 
-	function startTail() {
-		if (killed) return;
-		const args = sshArgs(keyPath, vmId);
-		// On reconnect, skip already-processed lines (+1 because tail is 1-indexed)
-		const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
-		tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+	function processLine(line: string) {
+		linesProcessed++;
+		if (!line.trim()) return;
+		try {
+			const event = JSON.parse(line);
+			if (eventHandler) eventHandler(event);
+		} catch {
+			// not JSON, ignore (tail noise, etc.)
+		}
+	}
 
-		tailChild.stdout!.on("data", (data: Buffer) => {
-			lineBuf += data.toString();
-			const lines = lineBuf.split("\n");
-			lineBuf = lines.pop() || "";
-			for (const line of lines) {
-				linesProcessed++;
-				if (!line.trim()) continue;
-				try {
-					const event = JSON.parse(line);
-					if (eventHandler) eventHandler(event);
-				} catch {
-					// not JSON, ignore (tail noise, etc.)
+	async function catchUpMissedLines() {
+		// On reconnect, check if lines were written while we were disconnected.
+		// Do a one-shot read to catch up before starting tail -f.
+		try {
+			const wcResult = await sshExec(keyPath, vmId, `wc -l < ${RPC_OUT} 2>/dev/null || echo 0`);
+			const totalLines = parseInt(wcResult.stdout.trim(), 10) || 0;
+			const startLine = linesProcessed + 1;
+			if (totalLines >= startLine) {
+				// There are lines we haven't processed — fetch them in one shot
+				const catchUp = await sshExec(keyPath, vmId, `sed -n '${startLine},${totalLines}p' ${RPC_OUT}`);
+				if (catchUp.stdout) {
+					const lines = catchUp.stdout.split("\n");
+					for (const line of lines) {
+						if (line) processLine(line);
+					}
 				}
 			}
-		});
+		} catch {
+			// catch-up failed — tail will handle it, best effort
+		}
+	}
 
-		tailChild.stderr!.on("data", (_d: Buffer) => {
-			// SSH noise (connection closed, broken pipe) — expected during reconnects
-		});
+	function startTail() {
+		if (killed) return;
 
-		tailChild.on("close", (_code) => {
+		// Catch up any missed lines before starting tail, then start tail
+		const doCatchUpAndTail = async () => {
+			if (killed) return;
+			if (linesProcessed > 0) {
+				// Only catch up on reconnect (linesProcessed > 0 means we've been running)
+				await catchUpMissedLines();
+			}
 			if (killed) return;
 
-			lineBuf = ""; // Reset partial line buffer on reconnect
-			// Reconnect after a delay — pi is still alive on the VM
-			reconnectTimer = setTimeout(() => startTail(), 3000);
+			const args = sshArgs(keyPath, vmId);
+			// On reconnect, skip already-processed lines (+1 because tail is 1-indexed)
+			const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
+			tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+
+			tailChild.stdout!.on("data", (data: Buffer) => {
+				lineBuf += data.toString();
+				const lines = lineBuf.split("\n");
+				lineBuf = lines.pop() || "";
+				for (const line of lines) {
+					processLine(line);
+				}
+			});
+
+			tailChild.stderr!.on("data", (_d: Buffer) => {
+				// SSH noise (connection closed, broken pipe) — expected during reconnects
+			});
+
+			tailChild.on("close", (_code) => {
+				if (killed) return;
+
+				lineBuf = ""; // Reset partial line buffer on reconnect
+				// Reconnect after a delay — pi is still alive on the VM
+				reconnectTimer = setTimeout(() => startTail(), 3000);
+			});
+		};
+
+		doCatchUpAndTail().catch(() => {
+			// If catch-up fails, still try to start tail after delay
+			if (!killed) {
+				reconnectTimer = setTimeout(() => startTail(), 3000);
+			}
 		});
 	}
 
@@ -514,26 +541,128 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	const agents = new Map<string, SwarmAgent>();
 	const rpcHandles = new Map<string, RpcHandle>();
 
+	// =========================================================================
+	// Fix 1: Activity timeout — auto-transition "working" → "done" after 5min
+	// of no RPC events. This is the safety net for lost agent_end events.
+	// =========================================================================
+	const ACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+	const ACTIVITY_CHECK_INTERVAL_MS = 30 * 1000; // check every 30s
+
+	const activityChecker = setInterval(() => {
+		const now = Date.now();
+		for (const [id, agent] of agents) {
+			if (agent.status !== "working") continue;
+			const silentMs = now - agent.lastActivityAt;
+			if (silentMs >= ACTIVITY_TIMEOUT_MS) {
+				console.error(
+					`[vers-swarm] ⚠️ Agent '${id}' has been silent for ${Math.round(silentMs / 1000)}s while "working" — ` +
+					`auto-transitioning to "done" (likely missed agent_end event)`
+				);
+				agent.status = "done";
+				if (agent.completionWatchdog) {
+					clearInterval(agent.completionWatchdog);
+					agent.completionWatchdog = undefined;
+				}
+			}
+		}
+	}, ACTIVITY_CHECK_INTERVAL_MS);
+
+	// Don't let the interval keep the process alive
+	if (activityChecker.unref) activityChecker.unref();
+
+	// =========================================================================
+	// Fix 2: Completion watchdog — after sending a task, periodically check
+	// if pi is still alive and producing output. Detects crashes and silent
+	// completions that the activity timeout alone might be slow to catch.
+	// =========================================================================
+	const WATCHDOG_INTERVAL_MS = 30 * 1000; // check every 30s
+	const WATCHDOG_SILENT_THRESHOLD_MS = 3 * 60 * 1000; // 3 min of no file growth
+
+	function startCompletionWatchdog(agentId: string) {
+		const agent = agents.get(agentId);
+		const handle = rpcHandles.get(agentId);
+		if (!agent || !handle) return;
+
+		// Clear any existing watchdog
+		if (agent.completionWatchdog) {
+			clearInterval(agent.completionWatchdog);
+		}
+
+		let lastKnownFileSize = -1;
+		let fileStaleSince = 0;
+
+		agent.completionWatchdog = setInterval(async () => {
+			// Stop if agent is no longer working
+			if (agent.status !== "working") {
+				if (agent.completionWatchdog) {
+					clearInterval(agent.completionWatchdog);
+					agent.completionWatchdog = undefined;
+				}
+				return;
+			}
+
+			try {
+				const keyPath = await ensureKeyFile(handle.vmId);
+
+				// Check RPC output file size
+				const sizeResult = await sshExec(keyPath, handle.vmId, `stat -c%s ${RPC_OUT} 2>/dev/null || echo 0`);
+				const currentSize = parseInt(sizeResult.stdout.trim(), 10) || 0;
+
+				if (lastKnownFileSize === -1) {
+					lastKnownFileSize = currentSize;
+					fileStaleSince = Date.now();
+					return;
+				}
+
+				if (currentSize !== lastKnownFileSize) {
+					// File is growing — agent is producing output
+					lastKnownFileSize = currentSize;
+					fileStaleSince = Date.now();
+					return;
+				}
+
+				// File hasn't grown — check how long
+				const staleDuration = Date.now() - fileStaleSince;
+				if (staleDuration < WATCHDOG_SILENT_THRESHOLD_MS) return;
+
+				// File has been stale for 3+ minutes — check if pi is alive
+				const aliveCheck = await sshExec(keyPath, handle.vmId,
+					`tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead`
+				);
+
+				if (aliveCheck.stdout.includes("dead")) {
+					console.error(`[vers-swarm] ⚠️ Agent '${agentId}' pi-rpc session is dead — marking as error`);
+					agent.status = "error";
+				} else {
+					console.error(
+						`[vers-swarm] ⚠️ Agent '${agentId}' pi is alive but silent for ${Math.round(staleDuration / 1000)}s — ` +
+						`marking as done (likely missed agent_end event)`
+					);
+					agent.status = "done";
+				}
+
+				if (agent.completionWatchdog) {
+					clearInterval(agent.completionWatchdog);
+					agent.completionWatchdog = undefined;
+				}
+			} catch (err) {
+				// SSH check failed — don't change status, will retry next interval
+				console.error(`[vers-swarm] watchdog check failed for '${agentId}': ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}, WATCHDOG_INTERVAL_MS);
+
+		// Don't block process exit
+		if (agent.completionWatchdog.unref) agent.completionWatchdog.unref();
+	}
+
 	function agentSummary(): string {
 		if (agents.size === 0) return "No agents in swarm.";
 		const lines = [];
 		for (const [id, a] of agents) {
 			const task = a.task ? ` — ${a.task.slice(0, 60)}` : "";
-			lines.push(`  ${id} [${a.status}] vm=${a.vmId}${task}`);
+			lines.push(`  ${id} [${a.status}] (${a.vmId.slice(0, 12)})${task}`);
 		}
 		return `Swarm (${agents.size} agents):\n${lines.join("\n")}`;
-	}
-
-	/** Format a compact summary of an agent's result — truncated output to save context */
-	function formatAgentSummary(a: SwarmAgent): string {
-		const MAX_SUMMARY_OUTPUT = 500; // chars of output to include in summary
-		let preview = a.lastOutput || "(no output)";
-		const fullLen = preview.length;
-		if (preview.length > MAX_SUMMARY_OUTPUT) {
-			preview = preview.slice(-MAX_SUMMARY_OUTPUT);
-			preview = `[...${fullLen - MAX_SUMMARY_OUTPUT} chars truncated...]\n${preview}`;
-		}
-		return `=== ${a.id} [${a.status}] (${a.vmId.slice(0, 12)}) | ${fullLen} chars total ===\n${preview}`;
 	}
 
 	function updateWidget(ctx?: { ui: { setWidget: (key: string, lines: string[] | undefined) => void } }) {
@@ -559,17 +688,15 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			commitId: Type.String({ description: "Golden image commit ID to branch from" }),
 			count: Type.Number({ description: "Number of agents to spawn" }),
 			labels: Type.Optional(Type.Array(Type.String(), { description: "Labels for each agent (e.g., ['feature', 'tests', 'docs'])" })),
-			provider: Type.Optional(Type.String({ description: "LLM provider to use (default: 'anthropic')" })),
-			apiKey: Type.String({ description: "API key for the LLM provider" }),
-			model: Type.Optional(Type.String({ description: "Model ID for agents (provider-specific)" })),
+			anthropicApiKey: Type.String({ description: "Anthropic API key for the agents to use" }),
+			model: Type.Optional(Type.String({ description: "Model ID for agents (default: claude-sonnet-4-20250514)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const { commitId, count, labels, provider, apiKey, model } = params as {
+			const { commitId, count, labels, anthropicApiKey, model } = params as {
 				commitId: string;
 				count: number;
 				labels?: string[];
-				provider?: string;
-				apiKey: string;
+				anthropicApiKey: string;
 				model?: string;
 			};
 
@@ -637,9 +764,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 				// Start pi RPC agent as daemon with Vers credentials
 				const handle = await startRpcAgent(keyPath, vmId, {
-					provider: provider || "anthropic",
-					apiKey,
-					model,
+					anthropicApiKey,
 					versApiKey,
 					versBaseUrl,
 				});
@@ -651,6 +776,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					status: "idle",
 					lastOutput: "",
 					events: [],
+					lastActivityAt: Date.now(),
 				};
 
 				// Wait for pi RPC to be ready by sending get_state
@@ -689,20 +815,44 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					// Keep last 200 events
 					if (agent.events.length > 200) agent.events.shift();
 
+					// Track activity for timeout detection
+					agent.lastActivityAt = Date.now();
+
 					if (event.type === "agent_start") {
 						agent.status = "working";
 					} else if (event.type === "agent_end") {
 						agent.status = "done";
+						// Clear watchdog on explicit completion
+						if (agent.completionWatchdog) {
+							clearInterval(agent.completionWatchdog);
+							agent.completionWatchdog = undefined;
+						}
 					} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
 						agent.lastOutput += event.assistantMessageEvent.delta;
 					}
 				});
 
+				// Set model if specified
+				if (model) {
+					handle.send({ type: "set_model", provider: "anthropic", modelId: model });
+				}
+
 				agents.set(label, agent);
 				rpcHandles.set(label, handle);
+
+				// Register agent in coordination registry (best effort)
+				await registryPost({
+					id: vmId,
+					name: label,
+					role: "worker",
+					address: `${vmId}.vm.vers.sh`,
+					registeredBy: "vers-swarm",
+					metadata: { agentId: label, commitId, parentSession: true },
+				});
+
 				results.push(`${label}: VM ${vmId} — ready`);
 
-				// Emit lifecycle event — agent-services extension handles registry
+				// Emit lifecycle event
 				pi.events.emit("vers:agent_spawned", {
 					vmId,
 					label,
@@ -742,8 +892,12 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			agent.task = task;
 			agent.status = "working";
 			agent.lastOutput = "";
+			agent.lastActivityAt = Date.now();
 
 			handle.send({ type: "prompt", message: task });
+
+			// Start completion watchdog to detect crashes and missed agent_end events
+			startCompletionWatchdog(agentId);
 
 			if (ctx) updateWidget(ctx);
 
@@ -758,7 +912,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "vers_swarm_wait",
 		label: "Wait for Agents",
-		description: "Block until all agents (or specified agents) finish. Returns a summary of each agent's status and output (truncated). Use vers_swarm_read to get full output from individual agents.",
+		description: "Block until all agents (or specified agents) finish. Returns each agent's full text output. Use after dispatching tasks to collect results without polling.",
 		parameters: Type.Object({
 			agentIds: Type.Optional(Type.Array(Type.String(), { description: "Specific agent IDs to wait for (default: all working/idle agents)" })),
 			timeoutSeconds: Type.Optional(Type.Number({ description: "Max seconds to wait (default: 300)" })),
@@ -776,15 +930,15 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			});
 
 			if (waiting.length === 0) {
-				// All already done, return summaries
+				// All already done, return results immediately
 				const results: string[] = [];
 				for (const id of targetIds) {
 					const a = agents.get(id);
 					if (!a) continue;
-					results.push(formatAgentSummary(a));
+					results.push(`=== ${id} [${a.status}] ===\n${a.lastOutput || "(no output)"}\n`);
 				}
 				return {
-					content: [{ type: "text", text: `All agents already done.\n\n${results.join("\n")}\n\nUse vers_swarm_read for full output.` }],
+					content: [{ type: "text", text: results.join("\n") }],
 					details: { waited: 0, agents: targetIds },
 				};
 			}
@@ -817,7 +971,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			for (const id of targetIds) {
 				const a = agents.get(id);
 				if (!a) continue;
-				results.push(formatAgentSummary(a));
+				results.push(`=== ${id} [${a.status}] ===\n${a.lastOutput || "(no output)"}\n`);
 			}
 
 			if (ctx) updateWidget(ctx);
@@ -830,7 +984,7 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text",
-					text: `${timedOut ? "TIMED OUT after" : "All agents finished in"} ${elapsed}s\n\n${results.join("\n")}\n\nUse vers_swarm_read for full output from any agent.`,
+					text: `${timedOut ? "TIMED OUT after" : "All agents finished in"} ${elapsed}s\n\n${results.join("\n")}`,
 				}],
 				details: { elapsed, timedOut, agents: targetIds },
 			};
@@ -866,10 +1020,10 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "vers_swarm_read",
 		label: "Read Agent Output",
-		description: "Read the latest text output from a specific swarm agent. Returns the last 5000 chars by default to save context. Pass tail=0 for full output.",
+		description: "Read the latest text output from a specific swarm agent. Returns the agent's accumulated response text.",
 		parameters: Type.Object({
 			agentId: Type.String({ description: "Agent label/ID to read from" }),
-			tail: Type.Optional(Type.Number({ description: "Number of characters from the end to return (default: 5000). Pass 0 for full output." })),
+			tail: Type.Optional(Type.Number({ description: "Number of characters from the end to return (default: all)" })),
 		}),
 		async execute(_id, params) {
 			const { agentId, tail } = params as { agentId: string; tail?: number };
@@ -878,16 +1032,22 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			if (!agent) throw new Error(`Agent '${agentId}' not found. Available: ${Array.from(agents.keys()).join(", ")}`);
 
 			let output = agent.lastOutput || "(no output yet)";
-			const fullLength = output.length;
-			// Default to 5000 chars to keep context manageable; tail=0 means full output
-			const effectiveTail = tail === 0 ? undefined : (tail || 5000);
-			if (effectiveTail && output.length > effectiveTail) {
-				output = `[...${fullLength - effectiveTail} chars truncated, showing last ${effectiveTail}...]\n` + output.slice(-effectiveTail);
+			if (tail && output.length > tail) {
+				output = "..." + output.slice(-tail);
+			}
+
+			// Fix 4: Add staleness warning when agent appears stuck
+			let warning = "";
+			if (agent.status === "working") {
+				const silentMinutes = Math.round((Date.now() - agent.lastActivityAt) / 60000);
+				if (silentMinutes >= 2) {
+					warning = `\n⚠️ No activity for ${silentMinutes} minute${silentMinutes !== 1 ? "s" : ""} — may be stuck\n`;
+				}
 			}
 
 			return {
-				content: [{ type: "text", text: `[${agentId}] (${agent.status}) — ${fullLength} chars total:\n\n${output}` }],
-				details: { agentId, status: agent.status, outputLength: fullLength },
+				content: [{ type: "text", text: `[${agentId}] (${agent.status}):${warning}\n${output}` }],
+				details: { agentId, status: agent.status, outputLength: agent.lastOutput.length, lastActivityAt: agent.lastActivityAt },
 			};
 		},
 	});
@@ -902,6 +1062,12 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			const results: string[] = [];
 
 			for (const [id, agent] of agents) {
+				// Clear completion watchdog
+				if (agent.completionWatchdog) {
+					clearInterval(agent.completionWatchdog);
+					agent.completionWatchdog = undefined;
+				}
+
 				// Kill RPC daemon on VM
 				const handle = rpcHandles.get(id);
 				if (handle) {
@@ -909,7 +1075,8 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 					rpcHandles.delete(id);
 				}
 
-
+				// Deregister from coordination registry (best effort)
+				await registryDelete(agent.vmId);
 
 				// Emit lifecycle event before deleting VM
 				pi.events.emit("vers:agent_destroyed", { vmId: agent.vmId, label: id });
@@ -944,164 +1111,200 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 		if (swarmEntries.length === 0) return ["No swarm agents found in registry."];
 
-		// Reconnect all agents in parallel — SSH probes run concurrently
-		// instead of sequentially (N agents × timeout → just 1× timeout)
-		const settled = await Promise.allSettled(swarmEntries.map(async (entry): Promise<string> => {
+		const results: string[] = [];
+
+		for (const entry of swarmEntries) {
 			const vmId = entry.id;
 			const label = (entry.metadata?.agentId as string) || entry.name;
 
 			// Skip if already tracked locally
 			if (agents.has(label)) {
-				return `${label}: already connected`;
+				results.push(`${label}: already connected`);
+				continue;
 			}
 
-			// Get SSH key for the VM
-			const keyPath = await ensureKeyFile(vmId);
+			try {
+				// Get SSH key for the VM
+				const keyPath = await ensureKeyFile(vmId);
 
-			// Check if pi-rpc tmux session is still running
-			const check = await sshExec(keyPath, vmId, "tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead");
-			if (!check.stdout.includes("alive")) {
-				return `${label}: VM ${vmId.slice(0, 12)} — pi-rpc session not running, skipping`;
-			}
+				// Check if pi-rpc tmux session is still running
+				const check = await sshExec(keyPath, vmId, "tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead");
+				if (!check.stdout.includes("alive")) {
+					results.push(`${label}: VM ${vmId} — pi-rpc session not running, skipping`);
+					continue;
+				}
 
-			// Re-establish tail -f on the RPC output (reconnect event stream)
-			// We create a lightweight RpcHandle that just tails and sends — pi is already running
-			let eventHandler: ((event: any) => void) | undefined;
-			let tailChild: ReturnType<typeof spawn> | null = null;
-			let lineBuf = "";
-			let killed = false;
-			let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-			// Start from end — we don't want old events, just new ones
-			let linesProcessed = 0;
+				// Re-establish tail -f on the RPC output (reconnect event stream)
+				// We create a lightweight RpcHandle that just tails and sends — pi is already running
+				let eventHandler: ((event: any) => void) | undefined;
+				let tailChild: ReturnType<typeof spawn> | null = null;
+				let lineBuf = "";
+				let killed = false;
+				let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+				// Start from end — we don't want old events, just new ones
+				let linesProcessed = 0;
 
-			// Count existing lines so we skip them
-			const wcResult = await sshExec(keyPath, vmId, `wc -l < ${RPC_OUT} 2>/dev/null || echo 0`);
-			const existingLines = parseInt(wcResult.stdout.trim(), 10) || 0;
-			linesProcessed = existingLines;
+				// Count existing lines so we skip them
+				const wcResult = await sshExec(keyPath, vmId, `wc -l < ${RPC_OUT} 2>/dev/null || echo 0`);
+				const existingLines = parseInt(wcResult.stdout.trim(), 10) || 0;
+				linesProcessed = existingLines;
 
-			function startTail() {
-				if (killed) return;
-				const args = sshArgs(keyPath, vmId);
-				const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
-				tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
-					stdio: ["ignore", "pipe", "pipe"],
-				});
+				function processLine(line: string) {
+					linesProcessed++;
+					if (!line.trim()) return;
+					try {
+						const event = JSON.parse(line);
+						if (eventHandler) eventHandler(event);
+					} catch { /* not JSON */ }
+				}
 
-				tailChild.stdout!.on("data", (data: Buffer) => {
-					lineBuf += data.toString();
-					const lines = lineBuf.split("\n");
-					lineBuf = lines.pop() || "";
-					for (const line of lines) {
-						linesProcessed++;
-						if (!line.trim()) continue;
-						try {
-							const event = JSON.parse(line);
-							if (eventHandler) eventHandler(event);
-						} catch { /* not JSON */ }
-					}
-				});
+				async function catchUpMissedLines() {
+					try {
+						const wcCheck = await sshExec(keyPath, vmId, `wc -l < ${RPC_OUT} 2>/dev/null || echo 0`);
+						const totalLines = parseInt(wcCheck.stdout.trim(), 10) || 0;
+						const startLine = linesProcessed + 1;
+						if (totalLines >= startLine) {
+							const catchUp = await sshExec(keyPath, vmId, `sed -n '${startLine},${totalLines}p' ${RPC_OUT}`);
+							if (catchUp.stdout) {
+								for (const line of catchUp.stdout.split("\n")) {
+									if (line) processLine(line);
+								}
+							}
+						}
+					} catch { /* best effort */ }
+				}
 
-				tailChild.stderr!.on("data", (d: Buffer) => {
-					const msg = d.toString().trim();
-					// SSH noise — silenced
-				});
-
-				tailChild.on("close", (code) => {
+				function startTail() {
 					if (killed) return;
-					// reconnect noise — silenced
-					lineBuf = "";
-					reconnectTimer = setTimeout(() => startTail(), 3000);
-				});
-			}
+					const doCatchUpAndTail = async () => {
+						if (killed) return;
+						if (linesProcessed > 0) await catchUpMissedLines();
+						if (killed) return;
 
-			startTail();
+						const args = sshArgs(keyPath, vmId);
+						const startLine = linesProcessed > 0 ? linesProcessed + 1 : 1;
+						tailChild = spawn("ssh", [...args, `tail -f -n +${startLine} ${RPC_OUT}`], {
+							stdio: ["ignore", "pipe", "pipe"],
+						});
 
-			function send(cmd: object) {
-				if (killed) return;
-				const json = JSON.stringify(cmd) + "\n";
-				const writeChild = spawn("ssh", [...sshArgs(keyPath, vmId), `cat > ${RPC_IN}`], {
-					stdio: ["pipe", "pipe", "pipe"],
-				});
-				writeChild.stdin.write(json);
-				writeChild.stdin.end();
-				writeChild.on("error", (err) => {
-					// send failure — silenced
-				});
-			}
+						tailChild.stdout!.on("data", (data: Buffer) => {
+							lineBuf += data.toString();
+							const lines = lineBuf.split("\n");
+							lineBuf = lines.pop() || "";
+							for (const line of lines) {
+								processLine(line);
+							}
+						});
 
-			async function kill() {
-				killed = true;
-				if (reconnectTimer) clearTimeout(reconnectTimer);
-				if (tailChild) {
-					try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
-					tailChild = null;
+						tailChild.stderr!.on("data", (_d: Buffer) => {
+							// SSH noise — silenced
+						});
+
+						tailChild.on("close", (_code) => {
+							if (killed) return;
+							lineBuf = "";
+							reconnectTimer = setTimeout(() => startTail(), 3000);
+						});
+					};
+
+					doCatchUpAndTail().catch(() => {
+						if (!killed) reconnectTimer = setTimeout(() => startTail(), 3000);
+					});
 				}
-				try {
-					await sshExec(keyPath, vmId, `
-						tmux kill-session -t pi-rpc 2>/dev/null || true
-						tmux kill-session -t pi-keeper 2>/dev/null || true
-						rm -rf ${RPC_DIR}
-					`);
-				} catch { /* VM might already be gone */ }
-			}
 
-			const handle: RpcHandle = { send, onEvent: (h) => { eventHandler = h; }, kill, vmId };
+				startTail();
 
-			// Probe agent state to confirm RPC is alive
-			const probeOk = await new Promise<boolean>((resolve) => {
-				let resolved = false;
-				const timeout = setTimeout(() => { if (!resolved) { resolved = true; resolve(false); } }, 15000);
+				function send(cmd: object) {
+					if (killed) return;
+					const json = JSON.stringify(cmd) + "\n";
+					const writeChild = spawn("ssh", [...sshArgs(keyPath, vmId), `cat > ${RPC_IN}`], {
+						stdio: ["pipe", "pipe", "pipe"],
+					});
+					writeChild.stdin.write(json);
+					writeChild.stdin.end();
+					writeChild.on("error", (err) => {
+						// send failure — silenced
+					});
+				}
+
+				async function kill() {
+					killed = true;
+					if (reconnectTimer) clearTimeout(reconnectTimer);
+					if (tailChild) {
+						try { tailChild.kill("SIGTERM"); } catch { /* ignore */ }
+						tailChild = null;
+					}
+					try {
+						await sshExec(keyPath, vmId, `
+							tmux kill-session -t pi-rpc 2>/dev/null || true
+							tmux kill-session -t pi-keeper 2>/dev/null || true
+							rm -rf ${RPC_DIR}
+						`);
+					} catch { /* VM might already be gone */ }
+				}
+
+				const handle: RpcHandle = { send, onEvent: (h) => { eventHandler = h; }, kill, vmId };
+
+				// Probe agent state to confirm RPC is alive
+				const probeOk = await new Promise<boolean>((resolve) => {
+					let resolved = false;
+					const timeout = setTimeout(() => { if (!resolved) { resolved = true; resolve(false); } }, 15000);
+					handle.onEvent((event) => {
+						if (!resolved && event.type === "response" && event.command === "get_state") {
+							resolved = true;
+							clearTimeout(timeout);
+							resolve(true);
+						}
+					});
+					handle.send({ id: "reconnect-check", type: "get_state" });
+					// Retry once after 3s
+					setTimeout(() => {
+						if (!resolved) handle.send({ id: "reconnect-check-2", type: "get_state" });
+					}, 3000);
+				});
+
+				if (!probeOk) {
+					killed = true;
+					if (tailChild) { try { tailChild.kill("SIGTERM"); } catch { /* ignore */ } }
+					results.push(`${label}: VM ${vmId} — pi-rpc alive but RPC probe failed, skipping`);
+					continue;
+				}
+
+				// Set up event handler for ongoing tracking
+				const agent: SwarmAgent = {
+					id: label,
+					vmId,
+					label,
+					status: "idle",
+					lastOutput: "",
+					events: [],
+					lastActivityAt: Date.now(),
+				};
+
 				handle.onEvent((event) => {
-					if (!resolved && event.type === "response" && event.command === "get_state") {
-						resolved = true;
-						clearTimeout(timeout);
-						resolve(true);
+					agent.events.push(JSON.stringify(event));
+					if (agent.events.length > 200) agent.events.shift();
+					agent.lastActivityAt = Date.now();
+					if (event.type === "agent_start") agent.status = "working";
+					else if (event.type === "agent_end") {
+						agent.status = "done";
+						if (agent.completionWatchdog) {
+							clearInterval(agent.completionWatchdog);
+							agent.completionWatchdog = undefined;
+						}
+					}
+					else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+						agent.lastOutput += event.assistantMessageEvent.delta;
 					}
 				});
-				handle.send({ id: "reconnect-check", type: "get_state" });
-				// Retry once after 3s
-				setTimeout(() => {
-					if (!resolved) handle.send({ id: "reconnect-check-2", type: "get_state" });
-				}, 3000);
-			});
 
-			if (!probeOk) {
-				killed = true;
-				if (tailChild) { try { tailChild.kill("SIGTERM"); } catch { /* ignore */ } }
-				return `${label}: VM ${vmId.slice(0, 12)} — pi-rpc alive but RPC probe failed, skipping`;
+				agents.set(label, agent);
+				rpcHandles.set(label, handle);
+				results.push(`${label}: VM ${vmId} — reconnected`);
+			} catch (err) {
+				results.push(`${label}: VM ${vmId} — reconnect failed: ${err instanceof Error ? err.message : String(err)}`);
 			}
-
-			// Set up event handler for ongoing tracking
-			const agent: SwarmAgent = {
-				id: label,
-				vmId,
-				label,
-				status: "idle",
-				lastOutput: "",
-				events: [],
-			};
-
-			handle.onEvent((event) => {
-				agent.events.push(JSON.stringify(event));
-				if (agent.events.length > 200) agent.events.shift();
-				if (event.type === "agent_start") agent.status = "working";
-				else if (event.type === "agent_end") agent.status = "done";
-				else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-					agent.lastOutput += event.assistantMessageEvent.delta;
-				}
-			});
-
-			agents.set(label, agent);
-			rpcHandles.set(label, handle);
-			return `${label}: VM ${vmId.slice(0, 12)} — reconnected`;
-		}));
-
-		const results = settled.map((r, i) => {
-			if (r.status === "fulfilled") return r.value;
-			const label = (swarmEntries[i].metadata?.agentId as string) || swarmEntries[i].name;
-			const vmId = swarmEntries[i].id;
-			return `${label}: VM ${vmId.slice(0, 12)} — reconnect failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
-		});
+		}
 
 		if (ctx) updateWidget(ctx);
 		return results;
@@ -1150,6 +1353,15 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 	// Clean up on session shutdown
 	pi.on("session_shutdown", async () => {
+		// Clear activity checker
+		clearInterval(activityChecker);
+		// Clear all watchdogs
+		for (const agent of agents.values()) {
+			if (agent.completionWatchdog) {
+				clearInterval(agent.completionWatchdog);
+				agent.completionWatchdog = undefined;
+			}
+		}
 		for (const handle of rpcHandles.values()) {
 			try { await handle.kill(); } catch { /* ignore */ }
 		}
