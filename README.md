@@ -2,9 +2,11 @@
 
 A [pi](https://github.com/mariozechner/pi-coding-agent) package for [Vers](https://vers.sh) VM orchestration. Provides extensions for managing Firecracker VMs, orchestrating multi-agent swarms, and running background processes — plus skills for golden image creation, platform development, and issue investigation.
 
+The installer also sets up [vers-agent-services](https://github.com/hdresearch/vers-agent-services), which gives your agents shared coordination tools: task board, activity feed, work log, VM registry, and usage tracking.
+
 ## Install
 
-One-liner that checks for pi, installs it if needed, and sets everything up:
+One-liner that checks for pi, installs it if needed, and sets everything up (including agent-services):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hdresearch/pi-v/main/install.sh | bash
@@ -13,7 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/hdresearch/pi-v/main/install.sh | b
 Or if you already have pi:
 
 ```bash
-pi install git@github.com:hdresearch/pi-v.git
+pi install https://github.com/hdresearch/pi-v
+pi install https://github.com/hdresearch/vers-agent-services
 ```
 
 ## Extensions
@@ -190,6 +193,37 @@ Two paths for contributing:
 
 1. **PR**: Fork via `gh repo fork`, create a fix branch, open a PR with description, fix explanation, and testing details
 2. **Issue**: If the user prefers not to fork, file a detailed GitHub Issue with findings and proposed diff
+
+---
+
+## Agent Services (Coordination Layer)
+
+Installed automatically by `install.sh` from [vers-agent-services](https://github.com/hdresearch/vers-agent-services). Gives agents tools for multi-agent coordination — requires deploying an agent-services server to an infra VM (the `bootstrap-fleet` skill walks you through this).
+
+| Tool | Description |
+|------|-------------|
+| `board_create_task` | Create a task on the shared board |
+| `board_list_tasks` | List/filter tasks |
+| `board_update_task` | Update task status, assignee, etc. |
+| `board_add_note` | Add a note to a task |
+| `board_submit_for_review` | Submit a task for review with artifacts |
+| `board_add_artifact` | Attach an artifact to a task |
+| `board_bump` | Bump a task's priority |
+| `feed_publish` | Publish an event to the activity feed |
+| `feed_list` | List/filter feed events |
+| `feed_stats` | Get feed summary statistics |
+| `log_append` | Append to the shared work log |
+| `log_query` | Query the work log |
+| `journal_entry` | Write a personal journal entry |
+| `registry_list` | List registered VMs |
+| `registry_register` | Register a VM in the registry |
+| `registry_discover` | Discover VMs by role |
+| `registry_heartbeat` | Send a heartbeat for a VM |
+| `usage_summary` | Get cost & token usage summary |
+| `usage_sessions` | List usage session records |
+| `usage_vms` | List VM lifecycle records |
+
+Agents also get automatic behaviors: self-registration, heartbeat, lifecycle events, and usage tracking — no manual wiring needed.
 
 ---
 

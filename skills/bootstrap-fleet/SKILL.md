@@ -14,6 +14,8 @@ Before starting, verify these are in place:
 - [ ] `ANTHROPIC_API_KEY` is set
 - [ ] `VERS_API_KEY` is set
 - [ ] pi-v package is installed (`pi install https://github.com/hdresearch/pi-v`)
+- [ ] vers-agent-services package is installed (`pi install https://github.com/hdresearch/vers-agent-services`)
+- [ ] Or run `curl -fsSL https://raw.githubusercontent.com/hdresearch/pi-v/main/install.sh | bash` to install both at once
 
 ```bash
 # Quick check — should show vers_vm_create, vers_swarm_spawn, etc.
@@ -192,12 +194,12 @@ Set the VM as active with `vers_vm_use`, then run the bootstrap script from the 
 2. Copy AGENTS.md context
 3. Set up swarm directories
 
-### 2c. Install agent-services package on the golden image
+### 2c. Install both packages on the golden image
 
 This is the step most people miss. The golden image needs BOTH packages:
 
 ```bash
-# On the VM
+# On the VM — install.sh handles both, or do it manually:
 pi install https://github.com/hdresearch/pi-v
 pi install https://github.com/hdresearch/vers-agent-services
 ```

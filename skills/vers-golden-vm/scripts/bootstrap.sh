@@ -80,10 +80,11 @@ mkdir -p /tmp/pi-rpc
 # --- Clone and install pi packages ---
 echo "[7/8] Installing pi packages..."
 
-# Add your pi packages here as "url|dir" pairs.
-# Private repos require GITHUB_TOKEN to be set above.
+# Default packages: pi-v (VM/swarm tools) and vers-agent-services (coordination tools).
+# Add your own as "url|dir" pairs. Private repos require GITHUB_TOKEN.
 PACKAGES=(
-  # "https://github.com/org/repo.git|/root/.pi/agent/git/github.com/org/repo"
+  "https://github.com/hdresearch/pi-v.git|/root/.pi/agent/git/github.com/hdresearch/pi-v"
+  "https://github.com/hdresearch/vers-agent-services.git|/root/.pi/agent/git/github.com/hdresearch/vers-agent-services"
 )
 
 for entry in "${PACKAGES[@]}"; do
