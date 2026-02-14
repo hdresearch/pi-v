@@ -382,6 +382,7 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
 		process.env.VERS_VM_REGISTRY_URL ? `export VERS_VM_REGISTRY_URL='${process.env.VERS_VM_REGISTRY_URL}'` : "",
 		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
+		`export VERS_PARENT_AGENT='${process.env.VERS_AGENT_NAME || "orchestrator"}'`,
 		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
 
