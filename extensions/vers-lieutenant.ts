@@ -681,11 +681,6 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lastActivityAt: new Date().toISOString(),
 			};
 
-			// Register handle BEFORE installing event handler — installEventHandler
-			// looks up the handle from rpcHandles, so it must be present first.
-			lieutenants.set(name, lt);
-			rpcHandles.set(name, handle);
-
 			// Install event handler (shared with reconnection path)
 			installEventHandler(lt);
 
@@ -693,6 +688,9 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 			if (model) {
 				handle.send({ type: "set_model", provider: "anthropic", modelId: model });
 			}
+
+			lieutenants.set(name, lt);
+			rpcHandles.set(name, handle);
 			await persist();
 			if (ctx) updateWidget(ctx);
 
@@ -861,7 +859,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lines.push([
 					`${icon} ${name} [${lt.status}]`,
 					`  Role: ${lt.role}`,
-					`  VM: ${lt.vmId.slice(0, 12)}`,
+					`  VM: ${lt.vmId}`,
 					`  Tasks: ${lt.taskCount}`,
 					`  Last active: ${lt.lastActivityAt}`,
 					`  Output: ${lt.lastOutput.length} chars${lt.status === "working" ? " (streaming...)" : ""}`,
@@ -1030,7 +1028,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				// Delete VM
 				try {
 					await versApi("DELETE", `/vm/${encodeURIComponent(lt.vmId)}`);
-					results.push(`${n}: destroyed (VM ${lt.vmId.slice(0, 12)}, ${lt.taskCount} tasks completed)`);
+					results.push(`${n}: destroyed (VM ${lt.vmId}, ${lt.taskCount} tasks completed)`);
 				} catch (err) {
 					results.push(`${n}: failed to delete VM — ${err instanceof Error ? err.message : String(err)}`);
 				}
@@ -1095,7 +1093,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 					const info = await versApi<{ state: string }>("GET", `/vm/${encodeURIComponent(entry.id)}/status`);
 					vmState = info.state;
 				} catch {
-					results.push(`${name}: VM ${entry.id.slice(0, 12)} not found, skipping`);
+					results.push(`${name}: VM ${entry.id} not found, skipping`);
 					continue;
 				}
 
@@ -1114,12 +1112,12 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				if (vmState === "Paused" || vmState === "paused") {
 					lt.status = "paused";
 					lieutenants.set(name, lt);
-					results.push(`${name}: reconnected (paused, VM ${entry.id.slice(0, 12)})`);
+					results.push(`${name}: reconnected (paused, VM ${entry.id})`);
 					continue;
 				}
 
 				if (vmState !== "Running" && vmState !== "running") {
-					results.push(`${name}: VM ${entry.id.slice(0, 12)} in unexpected state "${vmState}", skipping`);
+					results.push(`${name}: VM ${entry.id} in unexpected state "${vmState}", skipping`);
 					continue;
 				}
 
@@ -1128,7 +1126,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				const check = await sshExec(keyPath, entry.id, "tmux has-session -t pi-rpc 2>/dev/null && echo alive || echo dead");
 
 				if (!check.stdout.includes("alive")) {
-					results.push(`${name}: VM ${entry.id.slice(0, 12)} — pi-rpc not running, skipping`);
+					results.push(`${name}: VM ${entry.id} — pi-rpc not running, skipping`);
 					continue;
 				}
 
@@ -1137,7 +1135,7 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				lieutenants.set(name, lt);
 				rpcHandles.set(name, handle);
 				installEventHandler(lt);
-				results.push(`${name}: reconnected to VM ${entry.id.slice(0, 12)}`);
+				results.push(`${name}: reconnected to VM ${entry.id}`);
 			} catch (err) {
 				results.push(`${name}: reconnect failed — ${err instanceof Error ? err.message : String(err)}`);
 			}
