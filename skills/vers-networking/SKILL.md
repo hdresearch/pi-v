@@ -114,7 +114,7 @@ curl https://{infraVmId}.vm.vers.sh:3000/registry/discover/worker
 
 **All ports are public by default.** There is no firewall. Any service you start is reachable by anyone on the internet. Always protect services with authentication.
 
-For vers-agent-services, set `VERS_AUTH_TOKEN` env var. All endpoints except `/health` will require `Authorization: Bearer <token>`. Pass the same token to worker VMs so they can authenticate.
+For your coordination services, set a `VERS_AUTH_TOKEN` env var. All endpoints except `/health` will require `Authorization: Bearer <token>`. Pass the same token to worker VMs so they can authenticate.
 
 ```bash
 # Start with auth
