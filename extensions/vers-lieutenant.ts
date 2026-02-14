@@ -208,6 +208,10 @@ async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOption
 
 	const startScript = `
 		set -e
+		tmux kill-session -t pi-rpc 2>/dev/null || true
+		tmux kill-session -t pi-keeper 2>/dev/null || true
+		rm -f /tmp/pi-rpc/*.sock 2>/dev/null || true
+		sleep 1
 		mkdir -p ${RPC_DIR}
 		rm -f ${RPC_IN} ${RPC_OUT} ${RPC_ERR}
 		mkfifo ${RPC_IN}
@@ -863,11 +867,17 @@ export default function versLieutenantExtension(pi: ExtensionAPI) {
 				throw new Error(`VM ${vmId} failed to boot within 60s`);
 			}
 
-			// Start pi RPC daemon
-			const handle = await startRpcAgent(keyPath, vmId, {
-				anthropicApiKey,
-				systemPrompt,
-			});
+			// Start pi RPC daemon — clean up VM if startup fails
+			let handle: RpcHandle;
+			try {
+				handle = await startRpcAgent(keyPath, vmId, {
+					anthropicApiKey,
+					systemPrompt,
+				});
+			} catch (err) {
+				try { await versApi("DELETE", `/vm/${vmId}`); } catch {}
+				throw err;
+			}
 
 			// Wait for RPC ready
 			const rpcReady = await new Promise<boolean>((resolve) => {
