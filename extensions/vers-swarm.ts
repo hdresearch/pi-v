@@ -4,6 +4,8 @@
  * Orchestrate a swarm of pi coding agents running on Vers VMs.
  * Each agent runs pi in RPC mode inside a branched VM.
  *
+ * Supports multiple LLM providers: Anthropic, OpenAI, Google, Zai, and Azure.
+ *
  * Tools:
  *   vers_swarm_spawn    - Branch N VMs from a commit and start pi agents
  *   vers_swarm_task     - Send a task to a specific agent
@@ -24,6 +26,14 @@ import { join } from "node:path";
 // =============================================================================
 // Types
 // =============================================================================
+
+const PROVIDER_ENV_MAP: Record<string, string> = {
+	anthropic: "ANTHROPIC_API_KEY",
+	openai: "OPENAI_API_KEY",
+	google: "GOOGLE_API_KEY",
+	zai: "ZAI_API_KEY",
+	azure: "AZURE_OPENAI_API_KEY",
+};
 
 interface SwarmAgent {
 	id: string;
@@ -342,7 +352,9 @@ export async function syncPiConfig(keyPath: string, vmId: string): Promise<strin
  *   - If the tail SSH drops, pi stays alive — we just reconnect
  */
 export interface StartRpcOptions {
-	anthropicApiKey: string;
+	provider: string;
+	apiKey: string;
+	model?: string;
 	versApiKey?: string;
 	versBaseUrl?: string;
 }
@@ -362,15 +374,21 @@ export interface RpcHandle {
 }
 
 export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRpcOptions): Promise<RpcHandle> {
-	// Build env vars
+	// Build env vars using provider mapping
+	const envVar = PROVIDER_ENV_MAP[opts.provider] || `${opts.provider.toUpperCase()}_API_KEY`;
 	const envExports = [
-		`export ANTHROPIC_API_KEY='${opts.anthropicApiKey}'`,
+		`export ${envVar}='${opts.apiKey}'`,
 		opts.versApiKey ? `export VERS_API_KEY='${opts.versApiKey}'` : "",
 		opts.versBaseUrl ? `export VERS_BASE_URL='${opts.versBaseUrl}'` : "",
 		process.env.VERS_VM_REGISTRY_URL ? `export VERS_VM_REGISTRY_URL='${process.env.VERS_VM_REGISTRY_URL}'` : "",
 		process.env.VERS_AUTH_TOKEN ? `export VERS_AUTH_TOKEN='${process.env.VERS_AUTH_TOKEN}'` : "",
 		`export GIT_EDITOR=true`,
 	].filter(Boolean).join("; ");
+
+	// Build pi command with provider and optional model flags
+	const providerFlag = `--provider ${opts.provider}`;
+	const modelFlag = opts.model ? `--model ${opts.model}` : "";
+	const piCommand = `${envExports}; cd /root/workspace; pi --mode rpc --no-session ${providerFlag} ${modelFlag} < ${RPC_IN} >> ${RPC_OUT} 2>> ${RPC_ERR}`;
 
 	// Step 1: Start pi inside a tmux session on the VM.
 	// tmux survives SSH disconnects — if our tail -f drops, pi keeps running.
@@ -385,7 +403,7 @@ export async function startRpcAgent(keyPath: string, vmId: string, opts: StartRp
 		tmux new-session -d -s pi-keeper "sleep infinity > ${RPC_IN}"
 
 		# Start pi in a tmux session, reading from FIFO, writing to file
-		tmux new-session -d -s pi-rpc "${envExports}; cd /root/workspace; pi --mode rpc --no-session < ${RPC_IN} >> ${RPC_OUT} 2>> ${RPC_ERR}"
+		tmux new-session -d -s pi-rpc "${piCommand}"
 
 		# Wait a moment for processes to start
 		sleep 1
@@ -540,15 +558,17 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 			commitId: Type.String({ description: "Golden image commit ID to branch from" }),
 			count: Type.Number({ description: "Number of agents to spawn" }),
 			labels: Type.Optional(Type.Array(Type.String(), { description: "Labels for each agent (e.g., ['feature', 'tests', 'docs'])" })),
-			anthropicApiKey: Type.String({ description: "Anthropic API key for the agents to use" }),
-			model: Type.Optional(Type.String({ description: "Model ID for agents (default: claude-sonnet-4-20250514)" })),
+			provider: Type.Optional(Type.String({ description: "LLM provider to use (default: 'anthropic')" })),
+			apiKey: Type.String({ description: "API key for the LLM provider" }),
+			model: Type.Optional(Type.String({ description: "Model ID for agents (provider-specific)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const { commitId, count, labels, anthropicApiKey, model } = params as {
+			const { commitId, count, labels, provider, apiKey, model } = params as {
 				commitId: string;
 				count: number;
 				labels?: string[];
-				anthropicApiKey: string;
+				provider?: string;
+				apiKey: string;
 				model?: string;
 			};
 
@@ -616,7 +636,9 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 				// Start pi RPC agent as daemon with Vers credentials
 				const handle = await startRpcAgent(keyPath, vmId, {
-					anthropicApiKey,
+					provider: provider || "anthropic",
+					apiKey,
+					model,
 					versApiKey,
 					versBaseUrl,
 				});
@@ -674,11 +696,6 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 						agent.lastOutput += event.assistantMessageEvent.delta;
 					}
 				});
-
-				// Set model if specified
-				if (model) {
-					handle.send({ type: "set_model", provider: "anthropic", modelId: model });
-				}
 
 				agents.set(label, agent);
 				rpcHandles.set(label, handle);

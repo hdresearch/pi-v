@@ -10,7 +10,7 @@ Bootstrap a Vers VM into a reusable golden image for pi swarm agents. The golden
 ## Prerequisites
 
 - Vers extension loaded with valid API key
-- An Anthropic API key for child agents
+- An API key for your chosen LLM provider (Anthropic, Zai, Google, OpenAI, or Azure)
 
 ## Steps
 

@@ -20,7 +20,15 @@ pi install git@github.com:hdresearch/pi-v.git
 
 ### vers-vm — VM Lifecycle Management
 
-Core extension for creating, managing, and interacting with Vers Firecracker VMs. When a VM is set as active, pi's built-in tools (`read`, `bash`, `edit`, `write`) are transparently routed through SSH to execute on the VM.
+Core extension for creating, managing, and interacting with Vers Firecracker VMs. When a VM is set as active, pi's built-in tools (`read`, `bash`, `edit`, `write`) are transparently routed through SSH to execute on the VM. Supports multiple LLM providers (Anthropic, ZAI/GLM, Google, OpenAI, Azure).
+
+| Extension | Description |
+|-----------|-------------|
+| `vers-vm` | Create, branch, commit, restore, and manage Vers VMs. Provides `vers_vm_*` tools. |
+| `vers-swarm` | Spawn and orchestrate agent swarms across branched VMs. Supports multiple LLM providers. Provides `vers_swarm_*` tools. |
+| `browser` | Headless Chrome browser automation (navigate, click, type, screenshot, eval). |
+| `background-process` | Run and manage long-lived background processes (dev servers, watchers). |
+| `plan-mode` | Structured plan-then-execute workflow mode. |
 
 #### Tools
 
@@ -131,6 +139,20 @@ Skills provide specialized instructions that pi loads when a task matches. They'
 | [investigate-vers-issue](#investigate-vers-issue) | Deep investigation checklist for Vers platform issues (API, orchestrator, agent, docs) |
 | [contribute-fix](#contribute-fix) | How to contribute bug fixes back to pi-v via fork/PR or GitHub Issues |
 
+### Swarm Providers
+
+Swarm agents can run on any LLM provider supported by pi. When spawning a swarm, pass the `provider` and `apiKey` parameters:
+
+| Provider | Name | Env Var | Example Model |
+|----------|------|---------|---------------|
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
+| ZAI/GLM | `zai` | `ZAI_API_KEY` | `glm-4.7` |
+| Google | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| Azure | `azure` | `AZURE_OPENAI_API_KEY` | — |
+
+If no provider is specified, defaults to `anthropic`. Any provider not in this list will use `{PROVIDER_NAME}_API_KEY` as the env var.
+
 ### vers-golden-vm
 
 Bootstraps a Vers VM into a reusable golden image for swarm agents. Steps:
@@ -170,6 +192,13 @@ Two paths for contributing:
 2. **Issue**: If the user prefers not to fork, file a detailed GitHub Issue with findings and proposed diff
 
 ---
+
+## Dependencies
+
+```bash
+cd ~/.pi/agent/git/github.com/hdresearch/pi-v/extensions/browser
+npm install
+```
 
 ## Environment Variables
 
