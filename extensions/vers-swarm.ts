@@ -711,6 +711,15 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 				});
 
 				results.push(`${label}: VM ${vmId} — ready`);
+
+				// Emit lifecycle event — agent-services extension handles registry
+				pi.events.emit("vers:agent_spawned", {
+					vmId,
+					label,
+					role: "worker",
+					address: `${vmId}.vm.vers.sh`,
+					commitId,
+				});
 			}
 
 			if (ctx) updateWidget(ctx);
@@ -912,6 +921,9 @@ export default function versSwarmExtension(pi: ExtensionAPI) {
 
 				// Deregister from coordination registry (best effort)
 				await registryDelete(agent.vmId);
+
+				// Emit lifecycle event before deleting VM
+				pi.events.emit("vers:agent_destroyed", { vmId: agent.vmId, label: id });
 
 				// Delete VM
 				try {
