@@ -91,30 +91,24 @@ Switch back to local:
 vers_vm_local
 ```
 
-Add the env vars directly to the user's shell config so they persist and are available immediately. Detect which shell config exists:
+Write the agent-services config file so the extension picks it up automatically — no env vars or shell restart needed:
 
 ```bash
-# Detect shell config (prefer zshrc on macOS)
-SHELL_RC="$HOME/.bashrc"
-[ -f "$HOME/.zshrc" ] && SHELL_RC="$HOME/.zshrc"
-
-# Append Vers env vars (idempotent — skip if already present)
-if ! grep -q 'VERS_INFRA_URL' "$SHELL_RC" 2>/dev/null; then
-  cat >> "$SHELL_RC" << 'EOF'
-
-# Vers fleet coordination
-export VERS_INFRA_URL=https://<infra_vm_id>.vm.vers.sh:3000
-export VERS_AUTH_TOKEN=<the token from above>
+mkdir -p ~/.vers
+cat > ~/.vers/agent-services.json << EOF
+{
+  "url": "https://<infra_vm_id>.vm.vers.sh:3000",
+  "token": "<the token from above>"
+}
 EOF
-  echo "Added Vers env vars to $SHELL_RC"
-else
-  echo "Vers env vars already in $SHELL_RC"
-fi
+echo "Wrote ~/.vers/agent-services.json"
 ```
 
 Replace `<infra_vm_id>` and `<the token from above>` with the actual values.
 
-Also export them in the current pi process so they're live immediately (shell config only takes effect in new sessions):
+After writing this file, the agent-services extension will find it on next `/reload` or pi restart — no shell config editing needed.
+
+Also export env vars in the current pi process so they're live immediately without even a reload:
 
 ```bash
 export VERS_INFRA_URL=https://<infra_vm_id>.vm.vers.sh:3000
@@ -122,8 +116,6 @@ export VERS_AUTH_TOKEN=<the token from above>
 echo "VERS_INFRA_URL=$VERS_INFRA_URL"
 echo "VERS_AUTH_TOKEN=${VERS_AUTH_TOKEN:+set}"
 ```
-
-This gives you both: **immediate** availability in the current session and **persistence** for future sessions. No restart needed.
 
 ### 1d. Snapshot immediately
 
