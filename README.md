@@ -1,6 +1,6 @@
 # pi-v
 
-A [pi](https://github.com/mariozechner/pi-coding-agent) package for [Vers](https://vers.sh) VM orchestration. Provides extensions for managing Firecracker VMs, orchestrating multi-agent swarms, and running background processes — plus skills for golden image creation, platform development, and issue investigation.
+A [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) package for [Vers](https://vers.sh) VM orchestration. Provides extensions for managing Firecracker VMs, orchestrating multi-agent swarms, and running background processes — plus skills for golden image creation, platform development, and issue investigation.
 
 ## Install
 
